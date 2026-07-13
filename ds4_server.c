@@ -4909,7 +4909,9 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
         if (!think_end) {
             /* Model did not close thinking, ignore any DSML in reasoning */
             fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
+            *reasoning_out = xstrdup(body);
+            *content_out = xstrdup("");
             return true;
         }
         tool_search = think_end + 8;
@@ -15922,6 +15924,44 @@ static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     tool_calls_free(&calls);
 }
 
+static void test_unclosed_thinking_is_structured_reasoning(void) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(
+        "<think>unfinished reasoning", true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "unfinished reasoning"));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_dflash_reasoning_fragment_schema_split(void) {
+    char *reasoning = NULL;
+    char *content = NULL;
+    bool continues = false;
+    ds4_deepspec_split_reasoning_fragment(
+        "reasoning</think>final", true,
+        &reasoning, &content, &continues);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "reasoning"));
+    TEST_ASSERT(content && !strcmp(content, "final"));
+    TEST_ASSERT(!continues);
+    free(reasoning);
+    free(content);
+
+    ds4_deepspec_split_reasoning_fragment(
+        "still reasoning", true,
+        &reasoning, &content, &continues);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "still reasoning"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(continues);
+    free(reasoning);
+    free(content);
+}
+
 static void test_thinking_dsml_after_think_close_is_executable(void) {
     const char *generated =
         "<think>need a shell check</think>\n\n"
@@ -18188,6 +18228,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
+    test_unclosed_thinking_is_structured_reasoning();
+    test_dflash_reasoning_fragment_schema_split();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();

@@ -69,7 +69,6 @@ def main() -> int:
         "seed": 260713,
         "stream": False,
         "thinking": False,
-        "think_mode": "none",
         "ds4_return_runtime_metrics": True,
         "ds4_return_token_ids": True,
     }
@@ -84,11 +83,13 @@ def main() -> int:
     prefill_payload["max_tokens"] = args.prefill_tokens
     prefill = post(args.server + "/v1/chat/completions", prefill_payload, args.timeout)
     prefill_ids = tokens(prefill)
+    prefill_content = ui.parse_assistant_responses([prefill])
     dflash = post(args.server + "/v1/ds4/deepspec_generate_dflash", {
         "max_tokens": args.max_tokens - len(prefill_ids),
         "temperature": 0.0,
         "seed": 260713,
         "spec_top_k": 8,
+        "reasoning_active": bool(prefill_content.thinking and not prefill_content.final),
         "ds4_return_runtime_metrics": True,
         "ds4_return_token_ids": True,
     }, args.timeout)
@@ -136,6 +137,8 @@ def main() -> int:
             "accepted": accepted,
         },
         "final_exact": off_ids == on_ids and off_content.final == on_content.final,
+        "finish_reason_off": ui.response_finish(off),
+        "finish_reason_on": ui.response_finish(dflash),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

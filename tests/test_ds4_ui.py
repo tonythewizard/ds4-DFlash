@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -51,6 +52,7 @@ def args(**overrides):
         top_k=8,
         seed=1,
         timeout=30.0,
+        stream=False,
         system="Be clear, useful, and direct.",
     )
     values.update(overrides)
@@ -133,6 +135,18 @@ class ThinkingParserTests(unittest.TestCase):
             ui.AssistantContent("unfinished", ""),
         )
 
+    def test_opening_and_closing_tags_split_independently(self):
+        self.assertEqual(
+            self.parse_chunks("<thi", "nk>reason", "</thi", "nk>final"),
+            ui.AssistantContent("reason", "final"),
+        )
+
+    def test_final_in_same_chunk_and_empty_reasoning(self):
+        self.assertEqual(
+            self.parse_chunks("<think></think>final"),
+            ui.AssistantContent("", "final"),
+        )
+
     def test_no_thinking_and_empty(self):
         self.assertEqual(self.parse_chunks("answer only"), ui.AssistantContent("", "answer only"))
         self.assertEqual(self.parse_chunks(""), ui.AssistantContent())
@@ -150,6 +164,23 @@ class ThinkingParserTests(unittest.TestCase):
             }}]
         }])
         self.assertEqual(result, ui.AssistantContent("structured", "final"))
+
+    def test_structured_thinking_and_duplicate_aliases(self):
+        result = ui.parse_assistant_responses([{
+            "reasoning_content": "one copy",
+            "thinking": "one copy",
+            "content": "final",
+        }])
+        self.assertEqual(result, ui.AssistantContent("one copy", "final"))
+
+    def test_fixed_dflash_schema_routes_captured_reasoning(self):
+        fixture = json.loads(
+            (MODULE_PATH.parents[1] / "tests/fixtures/dflash_reasoning_truncation.json")
+            .read_text(encoding="utf-8")
+        )
+        result = ui.parse_assistant_responses([fixture["prefill"], fixture["dflash"]])
+        self.assertEqual(result.__dict__, fixture["expected"])
+        self.assertNotIn("Abbiamo", result.final)
 
     def test_dflash_on_and_off_identical_final_stream(self):
         off = [{"choices": [{"message": {"content": "<think>r</think>same final"}}]}]
@@ -246,6 +277,77 @@ class LanguageTests(unittest.TestCase):
         self.assertTrue(any("LANG:EN" in line for line in tui.stdscr.output))
         tui.handle_command("/reset")
         self.assertFalse(any(role.startswith("THINKING:") for role, _ in tui.transcript))
+        self.assertIsNone(tui.live_content)
+
+    def test_payload_explicitly_disables_stochastic_thinking_and_has_one_language_instruction(self):
+        tui = self.make_tui(language="it")
+        payload = tui.chat_payload(tui.messages + [{"role": "user", "content": "ciao"}])
+        self.assertIs(payload["thinking"], False)
+        language_messages = [
+            message for message in payload["messages"]
+            if message["content"] in ui.LANGUAGE_INSTRUCTIONS.values()
+        ]
+        self.assertEqual(language_messages, [
+            {"role": "system", "content": ui.LANGUAGE_INSTRUCTIONS["it"]}
+        ])
+        self.assertIn("ragionamento visibile", language_messages[0]["content"])
+
+
+class TokenLimitTests(unittest.TestCase):
+    def make_tui(self, language="en"):
+        return ui.DS4TUI(FakeWindow(), args(language=language))
+
+    def test_query_and_valid_update_are_future_only(self):
+        tui = self.make_tui()
+        current_payload = tui.chat_payload(tui.messages)
+        history = list(tui.messages)
+        tui.handle_command("/max-tokens")
+        self.assertIn("32", tui.transcript[-1][1])
+        tui.handle_command("/max-tokens 64")
+        self.assertEqual(tui.args.max_tokens, 64)
+        self.assertEqual(tui.messages, history)
+        self.assertEqual(current_payload["max_tokens"], 32)
+        self.assertEqual(tui.chat_payload(tui.messages)["max_tokens"], 64)
+
+    def test_invalid_text_below_and_above_range(self):
+        tui = self.make_tui()
+        for command in ("/max-tokens nope", "/max-tokens 2", "/max-tokens 257"):
+            with self.subTest(command=command):
+                tui.handle_command(command)
+                self.assertEqual(tui.args.max_tokens, 32)
+                self.assertIn("Invalid", tui.transcript[-1][1])
+
+    def test_localized_limit_notice_and_finish_detection(self):
+        tui = self.make_tui("it")
+        tui.events.put(("answer", {
+            "prompt": "x", "thinking": "ragionamento", "answer": "risposta",
+            "messages": tui.messages + [{"role": "user", "content": "x"}],
+            "stats": ui.asdict(ui.TurnStats(
+                finish_reason="length", stop_reason="max_tokens",
+                requested_max_tokens=32,
+            )),
+        }))
+        tui.process_events()
+        self.assertEqual(tui.transcript[-1][0], "NOTICE")
+        self.assertEqual(
+            tui.transcript[-1][1],
+            "[Risposta interrotta al limite di token configurato.]",
+        )
+        self.assertTrue(ui.token_limit_reached("length", ""))
+        self.assertFalse(ui.token_limit_reached("stop", "eos"))
+
+    def test_argument_range_and_default(self):
+        self.assertEqual(ui.max_tokens_argument("3"), 3)
+        self.assertEqual(ui.max_tokens_argument("256"), 256)
+        for value in ("bad", "2", "257"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                ui.max_tokens_argument(value)
+        original = sys.argv
+        try:
+            sys.argv = [str(MODULE_PATH)]
+            self.assertEqual(ui.parse_args().max_tokens, 256)
+        finally:
+            sys.argv = original
 
 
 if __name__ == "__main__":

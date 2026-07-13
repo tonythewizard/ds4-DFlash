@@ -35,9 +35,15 @@ LAUNCHER = Path(
 ).expanduser()
 
 LANGUAGE_INSTRUCTIONS = {
-    "en": "Respond in English unless the user explicitly requests another language.",
-    "it": "Rispondi in italiano salvo richiesta esplicita dell'utente di usare un'altra lingua.",
+    "en": "Use English for both visible reasoning and the final answer unless the user explicitly requests another language.",
+    "it": "Usa l'italiano sia per il ragionamento visibile sia per la risposta finale, salvo richiesta esplicita dell'utente di usare un'altra lingua.",
 }
+LEGACY_LANGUAGE_INSTRUCTIONS = {
+    "Respond in English unless the user explicitly requests another language.",
+    "Rispondi in italiano salvo richiesta esplicita dell'utente di usare un'altra lingua.",
+}
+MIN_MAX_TOKENS = 3
+MAX_MAX_TOKENS = 256
 LANGUAGE_ALIASES = {
     "en": "en", "english": "en",
     "it": "it", "italian": "it", "italiano": "it",
@@ -52,7 +58,7 @@ UI_TEXT = {
         "thinking_title": "THINKING",
         "thinking_empty": "No thinking stream received",
         "unknown": "Unknown command: {command}. Use /help",
-        "help": "/dflash on  /dflash off  /dflash auto\n/language  /language en  /language it  /reset\n/fallback on|off  /recover on|off|now  /stats  /status\n/buffer  /training  /clearstats  /quit",
+        "help": "/dflash on  /dflash off  /dflash auto\n/language  /language en  /language it  /reset\n/max-tokens  /max-tokens N  /fallback on|off\n/recover on|off|now  /stats  /status  /buffer  /training  /clearstats  /quit",
         "language_status": "Current language: {language}. Choices: en, it. Usage: /language en|it",
         "language_set": "Language set to English.",
         "language_invalid": "Unsupported language. Use /language en or /language it.",
@@ -76,6 +82,10 @@ UI_TEXT = {
         "footer": "PgUp/PgDn scroll | Ctrl-C exits | Enter sends",
         "stats_turns": "turns",
         "stats_normal": "normal",
+        "max_tokens_status": "Completion budget: {value} tokens. Valid range: {minimum}..{maximum}.",
+        "max_tokens_set": "Completion budget set to {value} tokens for future turns.",
+        "max_tokens_invalid": "Invalid completion budget. Use an integer from {minimum} to {maximum}.",
+        "token_limit_notice": "[Response stopped at the configured token limit.]",
     },
     "it": {
         "ready": "Pronto",
@@ -86,7 +96,7 @@ UI_TEXT = {
         "thinking_title": "RAGIONAMENTO",
         "thinking_empty": "Nessun flusso di ragionamento ricevuto",
         "unknown": "Comando sconosciuto: {command}. Usa /help",
-        "help": "/dflash on  /dflash off  /dflash auto\n/language  /language en  /language it  /reset\n/fallback on|off  /recover on|off|now  /stats  /status\n/buffer  /training  /clearstats  /quit",
+        "help": "/dflash on  /dflash off  /dflash auto\n/language  /language en  /language it  /reset\n/max-tokens  /max-tokens N  /fallback on|off\n/recover on|off|now  /stats  /status  /buffer  /training  /clearstats  /quit",
         "language_status": "Lingua corrente: {language}. Scelte: en, it. Uso: /language en|it",
         "language_set": "Lingua impostata su italiano.",
         "language_invalid": "Lingua non supportata. Usa /language en o /language it.",
@@ -110,6 +120,10 @@ UI_TEXT = {
         "footer": "PgUp/PgDn scorre | Ctrl-C esce | Enter invia",
         "stats_turns": "turni",
         "stats_normal": "normali",
+        "max_tokens_status": "Budget di completamento: {value} token. Intervallo valido: {minimum}..{maximum}.",
+        "max_tokens_set": "Budget di completamento impostato a {value} token per i turni futuri.",
+        "max_tokens_invalid": "Budget di completamento non valido. Usa un intero da {minimum} a {maximum}.",
+        "token_limit_notice": "[Risposta interrotta al limite di token configurato.]",
     },
 }
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -126,7 +140,7 @@ def ui_text(locale: str, key: str, **values: Any) -> str:
 def build_request_messages(
     history: list[dict[str, str]], language: str
 ) -> list[dict[str, str]]:
-    instructions = set(LANGUAGE_INSTRUCTIONS.values())
+    instructions = set(LANGUAGE_INSTRUCTIONS.values()) | LEGACY_LANGUAGE_INSTRUCTIONS
     cleaned = [
         dict(message) for message in history
         if not (message.get("role") == "system" and message.get("content") in instructions)
@@ -254,6 +268,7 @@ class ThinkingParser:
 
 def _structured_reasoning(response: dict[str, Any]) -> list[str]:
     values: list[str] = []
+    seen: set[str] = set()
     containers: list[dict[str, Any]] = [response]
     choices = response.get("choices")
     if isinstance(choices, list):
@@ -265,8 +280,11 @@ def _structured_reasoning(response: dict[str, Any]) -> list[str]:
                         containers.append(choice[key])
     for container in containers:
         for key in ("reasoning", "reasoning_content", "thinking"):
-            if isinstance(container.get(key), str) and container[key]:
-                values.append(container[key])
+            value = container.get(key)
+            if isinstance(value, str) and value and value not in seen:
+                values.append(value)
+                seen.add(value)
+                break
     return values
 
 
@@ -403,6 +421,11 @@ def merge_stream_metadata(responses: list[dict[str, Any]]) -> dict[str, Any]:
         for key in ("usage", "ds4_runtime", "timing_ms", "prompt_processing_ms"):
             if key in response and response[key] is not None:
                 merged[key] = response[key]
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            finish = choices[0].get("finish_reason")
+            if finish:
+                merged["finish_reason"] = finish
     return merged
 
 
@@ -460,7 +483,9 @@ def extract_text(response: dict[str, Any]) -> str:
                 return delta["content"]
             if isinstance(choice.get("text"), str):
                 return choice["text"]
-    for key in ("text", "content"):
+    # DFlash retains raw ``text`` for legacy clients but exposes normalized
+    # final ``content`` alongside structured reasoning. Prefer the schema field.
+    for key in ("content", "text"):
         if isinstance(response.get(key), str):
             return response[key]
     return ""
@@ -472,6 +497,20 @@ def as_int(value: Any) -> int:
     if isinstance(value, (int, float)):
         return int(value)
     return 0
+
+
+def response_finish(response: dict[str, Any]) -> tuple[str, str]:
+    finish = response.get("finish_reason")
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        finish = choices[0].get("finish_reason", finish)
+    runtime = response.get("ds4_runtime")
+    stop = runtime.get("stop_reason") if isinstance(runtime, dict) else response.get("stop_reason")
+    return (str(finish or ""), str(stop or ""))
+
+
+def token_limit_reached(finish_reason: str, stop_reason: str) -> bool:
+    return finish_reason.lower() == "length" or stop_reason.lower() in {"length", "max_tokens"}
 
 
 @dataclass
@@ -489,6 +528,9 @@ class TurnStats:
     cycles: int = 0
     total_wall_s: float = 0.0
     error: str = ""
+    finish_reason: str = ""
+    stop_reason: str = ""
+    requested_max_tokens: int = 0
 
     @property
     def acceptance(self) -> float:
@@ -511,6 +553,10 @@ class TurnStats:
     @property
     def prefill_display(self) -> str:
         return format_prefill_metric(self.prompt_tokens, self.prompt_processing_ms)
+
+    @property
+    def token_limit_reached(self) -> bool:
+        return token_limit_reached(self.finish_reason, self.stop_reason)
 
 
 @dataclass
@@ -627,6 +673,22 @@ class DS4TUI:
     def outgoing_messages(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
         return build_request_messages(history, self.language)
 
+    def chat_payload(self, history: list[dict[str, str]]) -> dict[str, Any]:
+        return {
+            "model": "ds4",
+            "messages": self.outgoing_messages(history),
+            "max_tokens": self.args.max_tokens,
+            "temperature": self.args.temperature,
+            "seed": self.args.seed,
+            # DFlash correctness-first is greedy. Explicitly disable target
+            # thinking because that mode forces stochastic sampling server-side.
+            "thinking": False,
+            "stream": self.args.stream,
+            "stream_options": {"include_usage": True},
+            "ds4_return_runtime_metrics": True,
+            "ds4_return_token_ids": True,
+        }
+
     def set_status(self, text: str) -> None:
         self.status_message = text
         self.status_time = time.time()
@@ -701,6 +763,7 @@ class DS4TUI:
                 if not isinstance(usage, dict):
                     usage = {}
                 prompt_tokens, prompt_processing_ms = prompt_metrics(response)
+                finish_reason, stop_reason = response_finish(response)
                 stats = TurnStats(
                     mode="normal",
                     prompt_tokens=prompt_tokens,
@@ -708,6 +771,9 @@ class DS4TUI:
                     committed_tokens=as_int(usage.get("completion_tokens")),
                     generation_wall_s=wall,
                     total_wall_s=time.perf_counter() - started,
+                    finish_reason=finish_reason,
+                    stop_reason=stop_reason,
+                    requested_max_tokens=as_int(payload.get("max_tokens")),
                 )
                 return answer, stats
             except Exception as exc:
@@ -727,7 +793,9 @@ class DS4TUI:
             raise RuntimeError(f"DeepSpec reset failed: {reset}")
 
         prefill_payload = dict(payload)
-        prefill_payload["max_tokens"] = self.args.prefill_tokens
+        requested_max_tokens = as_int(payload.get("max_tokens"))
+        prefill_tokens = min(self.args.prefill_tokens, requested_max_tokens)
+        prefill_payload["max_tokens"] = prefill_tokens
         prefill_payload["stream"] = False
 
         self.events.put(("phase", "PREFILL"))
@@ -741,27 +809,36 @@ class DS4TUI:
             raise RuntimeError(f"prefill failed: {prefill['error']}")
 
         self.events.put(("phase", "DFLASH"))
+        usage = prefill.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+
+        prefill_content = parse_assistant_responses([prefill])
+        reasoning_active = bool(prefill_content.thinking and not prefill_content.final)
+        dflash_request = {
+            "max_tokens": max(1, requested_max_tokens - prefill_tokens),
+            "temperature": self.args.temperature,
+            "seed": self.args.seed,
+            "spec_top_k": self.args.top_k,
+            "sidecar_url": self.sidecar_generate,
+            "reasoning_active": reasoning_active,
+            "ds4_return_runtime_metrics": True,
+            "ds4_return_token_ids": True,
+        }
+        # The endpoint call above is kept close to request construction so OFF,
+        # ON and fallback all feed the same response normalizer.
         dflash, generation_wall = http_json(
             "POST",
             self.base_server + "/v1/ds4/deepspec_generate_dflash",
-            {
-                "max_tokens": max(1, self.args.max_tokens - self.args.prefill_tokens),
-                "temperature": self.args.temperature,
-                "seed": self.args.seed,
-                "spec_top_k": self.args.top_k,
-                "sidecar_url": self.sidecar_generate,
-            },
+            dflash_request,
             self.args.timeout,
         )
         if dflash.get("ok") is not True:
             raise RuntimeError(f"DFlash failed: {dflash}")
 
-        usage = prefill.get("usage")
-        if not isinstance(usage, dict):
-            usage = {}
-
         answer = parse_assistant_responses([prefill, dflash])
         prompt_tokens, prompt_processing_ms = prompt_metrics(prefill)
+        finish_reason, stop_reason = response_finish(dflash)
         stats = TurnStats(
             mode="dflash",
             prompt_tokens=prompt_tokens,
@@ -774,6 +851,9 @@ class DS4TUI:
             tried=as_int(dflash.get("total_tried_tokens")),
             cycles=as_int(dflash.get("cycles")),
             total_wall_s=time.perf_counter() - started,
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+            requested_max_tokens=requested_max_tokens,
         )
         return answer, stats
 
@@ -805,18 +885,7 @@ class DS4TUI:
 
     def send_worker(self, prompt: str) -> None:
         tentative = self.messages + [{"role": "user", "content": prompt}]
-        payload = {
-            "model": "ds4",
-            "messages": self.outgoing_messages(tentative),
-            "max_tokens": self.args.max_tokens,
-            "temperature": self.args.temperature,
-            "seed": self.args.seed,
-            "think_mode": "none",
-            "stream": self.args.stream,
-            "stream_options": {"include_usage": True},
-            "ds4_return_runtime_metrics": True,
-            "ds4_return_token_ids": True,
-        }
+        payload = self.chat_payload(tentative)
 
         try:
             mode = self.effective_mode()
@@ -917,6 +986,31 @@ class DS4TUI:
                 self.add_line("SYS", ui_text(self.language, "dflash_usage"))
             return
 
+        if head == "/max-tokens":
+            values = {
+                "value": self.args.max_tokens,
+                "minimum": MIN_MAX_TOKENS,
+                "maximum": MAX_MAX_TOKENS,
+            }
+            if len(parts) == 1:
+                self.add_line("SYS", ui_text(self.language, "max_tokens_status", **values))
+                return
+            try:
+                selected = int(parts[1]) if len(parts) == 2 else -1
+            except ValueError:
+                selected = -1
+            if not MIN_MAX_TOKENS <= selected <= MAX_MAX_TOKENS:
+                self.add_line("SYS", ui_text(
+                    self.language, "max_tokens_invalid",
+                    minimum=MIN_MAX_TOKENS, maximum=MAX_MAX_TOKENS,
+                ))
+                return
+            self.args.max_tokens = selected
+            self.add_line("SYS", ui_text(
+                self.language, "max_tokens_set", value=selected,
+            ))
+            return
+
         if head == "/fallback":
             if len(parts) == 2 and parts[1] in {"on", "off"}:
                 self.fallback_enabled = parts[1] == "on"
@@ -949,6 +1043,7 @@ class DS4TUI:
         if head == "/reset":
             self.messages = [{"role": "system", "content": self.args.system}]
             self.transcript.clear()
+            self.live_content = None
             self.add_line("SYS", ui_text(self.language, "reset"))
             return
 
@@ -1044,6 +1139,8 @@ class DS4TUI:
                 ]
                 if stats.fallback:
                     self.add_line("FALLBACK", stats.fallback)
+                if stats.token_limit_reached:
+                    self.add_line("NOTICE", ui_text(self.language, "token_limit_notice"))
 
     def wrapped_lines(self, width: int) -> list[tuple[str, str]]:
         lines: list[tuple[str, str]] = []
@@ -1109,7 +1206,8 @@ class DS4TUI:
 
         header1 = (
             f" DS4 | DFLASH {dflash_label}/{effective} | "
-            f"LANG:{self.language.upper()} | PHASE {self.phase} | TRAIN {train_status} "
+            f"LANG:{self.language.upper()} | MAX:{self.args.max_tokens} | "
+            f"PHASE {self.phase} | TRAIN {train_status} "
         )
         safe_addstr(self.stdscr, 0, 0, header1, curses.A_REVERSE | curses.A_BOLD)
 
@@ -1161,7 +1259,8 @@ class DS4TUI:
             safe_addstr(self.stdscr, divider_y + 1 + index, 0, line, attr)
 
         footer = (
-            f" {self.status_message} | LANG:{self.language.upper()} | /language en|it | /dflash on|off|auto | "
+            f" {self.status_message} | LANG:{self.language.upper()} | MAX:{self.args.max_tokens} | "
+            f"/language en|it | /dflash on|off|auto | "
             f"/fallback on|off | /recover now | /help "
         )
         safe_addstr(self.stdscr, status_y, 0, footer, curses.A_REVERSE)
@@ -1250,6 +1349,18 @@ class DS4TUI:
         return 0
 
 
+def max_tokens_argument(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max tokens must be an integer") from exc
+    if not MIN_MAX_TOKENS <= number <= MAX_MAX_TOKENS:
+        raise argparse.ArgumentTypeError(
+            f"max tokens must be in {MIN_MAX_TOKENS}..{MAX_MAX_TOKENS}"
+        )
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DS4 Codex-style terminal UI")
     parser.add_argument("--server", default="http://127.0.0.1:8080")
@@ -1264,7 +1375,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dflash", choices=("on", "off", "auto"), default="off")
     parser.add_argument("--language", choices=("en", "it"), default="en")
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=max_tokens_argument, default=256)
     parser.add_argument("--prefill-tokens", type=int, default=2)
     parser.add_argument("--temperature", type=float, default=0.0001)
     parser.add_argument("--top-k", type=int, default=8)

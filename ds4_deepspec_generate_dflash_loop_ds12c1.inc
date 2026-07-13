@@ -4,6 +4,31 @@ static long long ds4_deepspec_ds13b_now_ms(void) {
     return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
 }
 
+static void ds4_deepspec_split_reasoning_fragment(const char *text,
+                                                  bool reasoning_active,
+                                                  char **reasoning_out,
+                                                  char **content_out,
+                                                  bool *reasoning_continues_out) {
+    const char *value = text ? text : "";
+    *reasoning_out = NULL;
+    *content_out = NULL;
+    *reasoning_continues_out = reasoning_active;
+    if (!reasoning_active) {
+        *content_out = xstrdup(value);
+        return;
+    }
+    if (!strncmp(value, "<think>", 7)) value += 7;
+    const char *close = strstr(value, "</think>");
+    if (!close) {
+        *reasoning_out = xstrdup(value);
+        *content_out = xstrdup("");
+        return;
+    }
+    *reasoning_out = xstrndup(value, (size_t)(close - value));
+    *content_out = xstrdup(close + 8);
+    *reasoning_continues_out = false;
+}
+
 static void generate_deepspec_generate_dflash_job(server *s, job *j) {
     const char *base = getenv("DS4_DEEPSPEC_DUMP_PREFIX");
     if (!base || !base[0]) base = "/tmp/ds4_deepspec_dflash";
@@ -29,6 +54,8 @@ static void generate_deepspec_generate_dflash_job(server *s, job *j) {
 
     int requested_max_tokens = j->req.max_tokens > 0 ? j->req.max_tokens : 1;
     if (requested_max_tokens > 256) requested_max_tokens = 256;
+    bool reasoning_active = ds4_json_parse_optional_bool_field(
+        j->req.raw_body, "reasoning_active", false);
 
     int chat_stop_token = -1;
     ds4_tokens chat_stop_tokens = {0};
@@ -371,6 +398,13 @@ static void generate_deepspec_generate_dflash_job(server *s, job *j) {
     }
     ds13b_decode_text_ms = ds4_deepspec_ds13b_now_ms() - ds13b_decode_t0_ms;
 
+    char *reasoning_content = NULL;
+    char *final_content = NULL;
+    bool reasoning_continues = false;
+    ds4_deepspec_split_reasoning_fragment(
+        decoded.ptr ? decoded.ptr : "", reasoning_active,
+        &reasoning_content, &final_content, &reasoning_continues);
+
     buf body = {0};
     buf_puts(&body, "{\"object\":\"ds4.deepspec_generate_dflash\",\"mode\":\"loop\",");
     buf_puts(&body, "\"requested_max_tokens\":");
@@ -441,7 +475,13 @@ static void generate_deepspec_generate_dflash_job(server *s, job *j) {
     buf_puts(&body, ",\"text\":");
     json_escape(&body, decoded.ptr ? decoded.ptr : "");
     buf_puts(&body, ",\"content\":");
-    json_escape(&body, decoded.ptr ? decoded.ptr : "");
+    json_escape(&body, final_content ? final_content : "");
+    if (reasoning_content) {
+        buf_puts(&body, ",\"reasoning_content\":");
+        json_escape(&body, reasoning_content);
+    }
+    buf_puts(&body, ",\"reasoning_continues\":");
+    buf_puts(&body, reasoning_continues ? "true" : "false");
     buf_puts(&body, ",\"position\":");
     buf_printf(&body, "%d", ds4_session_pos(s->session));
     buf_puts(&body, ",\"residual_sampling\":");
@@ -543,6 +583,8 @@ static void generate_deepspec_generate_dflash_job(server *s, job *j) {
 
     buf_free(&body);
     buf_free(&decoded);
+    free(reasoning_content);
+    free(final_content);
     free(last_draft_probs_file);
     free(sidecar_url);
 }

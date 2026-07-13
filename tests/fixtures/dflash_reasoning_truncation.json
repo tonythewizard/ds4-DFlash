@@ -1,0 +1,29 @@
+{
+  "description": "Reduced from the 2026-07-13 Italian DFlash raw reproduction; token budget ended inside reasoning.",
+  "prefill": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "Abb"
+        },
+        "finish_reason": "length"
+      }
+    ]
+  },
+  "dflash": {
+    "content": "",
+    "text": "iamo una richiesta: \"Pu",
+    "reasoning_content": "iamo una richiesta: \"Pu",
+    "reasoning_continues": true,
+    "finish_reason": "length",
+    "ds4_runtime": {
+      "stop_reason": "max_tokens"
+    }
+  },
+  "expected": {
+    "thinking": "Abbiamo una richiesta: \"Pu",
+    "final": ""
+  }
+}
