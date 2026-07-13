@@ -488,6 +488,17 @@ fail:
 typedef enum {
     REQ_CHAT,
     REQ_COMPLETION,
+    REQ_SPEC_VERIFY_ARGMAX,
+    REQ_SPEC_VERIFY_DFLASH,
+    REQ_SPEC_TARGET_LOGPROBS,
+    REQ_DS4_DEBUG_HIDDEN_LAST,
+    REQ_DS4_DEBUG_HIDDEN_LAYERS,
+    REQ_DS4_DEBUG_HIDDEN_SEQUENCE,
+    REQ_DS4_DEBUG_LAST_HIDDEN_SEQUENCE,
+    REQ_DS4_DEEPSPEC_DUMP_SEQUENCE,
+    REQ_DS4_DEEPSPEC_RESET_SAMPLE,
+    REQ_DS4_DEEPSPEC_DRAFT_VERIFY_ONCE,
+    REQ_DS4_DEEPSPEC_GENERATE_DFLASH,
 } req_kind;
 
 typedef enum {
@@ -601,6 +612,12 @@ typedef struct {
     char *model;
     bool model_from_request;
     stop_list stops;
+    int spec_draft_tokens[16];
+    int spec_draft_n;
+    int spec_top_k;
+    int spec_committed_tokens[17];
+    int spec_committed_n;
+    int spec_accepted_draft_tokens;
     char *raw_body;
     char *prompt_text;
     tool_schema_orders tool_orders;
@@ -612,6 +629,10 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    /* Opt-in native token provenance. Disabled by default to preserve the
+     * existing API response size and prevent accidental token-ID disclosure. */
+    bool ds4_return_runtime_metrics;
+    bool ds4_return_token_ids;
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
@@ -2632,6 +2653,402 @@ static void anthropic_prepare_live_continuation(request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+
+static bool parse_spec_verify_argmax_request(ds4_engine *e, const char *body,
+                                             int def_tokens, int ctx_size,
+                                             request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    request_init(r, REQ_SPEC_VERIFY_ARGMAX, 0);
+
+    const char *key = strstr(body ? body : "", "\"draft_token_ids\"");
+    if (!key) {
+        snprintf(err, errlen, "missing draft_token_ids");
+        return false;
+    }
+
+    const char *p = strchr(key, '[');
+    if (!p) {
+        snprintf(err, errlen, "draft_token_ids must be an array");
+        return false;
+    }
+    p++;
+
+    int n = 0;
+    for (;;) {
+        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (n >= (int)(sizeof(r->spec_draft_tokens) / sizeof(r->spec_draft_tokens[0]))) {
+            snprintf(err, errlen, "draft_token_ids too long; max 16");
+            return false;
+        }
+
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > INT_MAX) {
+            snprintf(err, errlen, "invalid draft token id");
+            return false;
+        }
+        r->spec_draft_tokens[n++] = (int)v;
+        p = end;
+
+        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') {
+            p++;
+            break;
+        }
+
+        snprintf(err, errlen, "expected comma or closing bracket in draft_token_ids");
+        return false;
+    }
+
+    r->spec_draft_n = n;
+    return true;
+}
+
+
+static const char *ds4_json_find_array_after_key(const char *body, const char *key_name) {
+    char needle[96];
+    snprintf(needle, sizeof(needle), "\"%s\"", key_name);
+    const char *key = strstr(body ? body : "", needle);
+    if (!key) return NULL;
+    return strchr(key, '[');
+}
+
+static bool ds4_json_parse_int_array16(const char *body, const char *key_name,
+                                       int *out, int *out_n,
+                                       int max_n,
+                                       char *err, size_t errlen) {
+    const char *q = ds4_json_find_array_after_key(body, key_name);
+    if (!q) {
+        snprintf(err, errlen, "missing %s", key_name);
+        return false;
+    }
+    q++;
+
+    int n = 0;
+    for (;;) {
+        while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+        if (*q == ']') {
+            q++;
+            break;
+        }
+        if (n >= max_n) {
+            snprintf(err, errlen, "%s too long; max %d", key_name, max_n);
+            return false;
+        }
+
+        char *end = NULL;
+        long v = strtol(q, &end, 10);
+        if (end == q || v < 0 || v > INT_MAX) {
+            snprintf(err, errlen, "invalid token id in %s", key_name);
+            return false;
+        }
+        out[n++] = (int)v;
+        q = end;
+
+        while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+        if (*q == ',') {
+            q++;
+            continue;
+        }
+        if (*q == ']') {
+            q++;
+            break;
+        }
+
+        snprintf(err, errlen, "expected comma or closing bracket in %s", key_name);
+        return false;
+    }
+
+    if (out_n) *out_n = n;
+    return true;
+}
+
+static int ds4_json_parse_optional_top_k(const char *body, int def_value) {
+    const char *key = strstr(body ? body : "", "\"top_k\"");
+    if (!key) return def_value;
+    const char *q = strchr(key, ':');
+    if (!q) return def_value;
+    q++;
+    while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+    char *end = NULL;
+    long v = strtol(q, &end, 10);
+    if (end == q || v <= 0) return def_value;
+    if (v > 64) v = 64;
+    return (int)v;
+}
+
+
+static bool parse_spec_verify_dflash_request(ds4_engine *e, const char *body,
+                                             int def_tokens, int ctx_size,
+                                             request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    request_init(r, REQ_SPEC_VERIFY_DFLASH, 0);
+
+    if (!ds4_json_parse_int_array16(body,
+                                    "draft_token_ids",
+                                    r->spec_draft_tokens,
+                                    &r->spec_draft_n,
+                                    (int)(sizeof(r->spec_draft_tokens) / sizeof(r->spec_draft_tokens[0])),
+                                    err,
+                                    errlen)) {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_spec_target_logprobs_request(ds4_engine *e, const char *body,
+                                               int def_tokens, int ctx_size,
+                                               request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    request_init(r, REQ_SPEC_TARGET_LOGPROBS, 0);
+
+    if (!ds4_json_parse_int_array16(body,
+                                    "token_ids",
+                                    r->spec_draft_tokens,
+                                    &r->spec_draft_n,
+                                    (int)(sizeof(r->spec_draft_tokens) / sizeof(r->spec_draft_tokens[0])),
+                                    err,
+                                    errlen)) {
+        return false;
+    }
+
+    r->spec_top_k = ds4_json_parse_optional_top_k(body, 8);
+    return true;
+}
+
+
+static int ds4_json_parse_optional_limit(const char *body, int def_value) {
+    const char *key = strstr(body ? body : "", "\"limit\"");
+    if (!key) return def_value;
+    const char *p = strchr(key, ':');
+    if (!p) return def_value;
+    p++;
+    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || v <= 0) return def_value;
+    if (v > 256) v = 256;
+    return (int)v;
+}
+
+
+static int ds4_json_parse_optional_max_tokens_ds12(const char *body, int def_value) {
+    const char *key = strstr(body ? body : "", "max_tokens");
+    if (!key) return def_value;
+    const char *p = strchr(key, 58);
+    if (!p) return def_value;
+    p++;
+    json_ws(&p);
+    char *endp = NULL;
+    long v = strtol(p, &endp, 10);
+    if (endp == p) return def_value;
+    if (v < 1) v = 1;
+    if (v > 256) v = 256;
+    return (int)v;
+}
+
+
+static bool parse_debug_hidden_last_request(ds4_engine *e, const char *body,
+                                            int def_tokens, int ctx_size,
+                                            request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEBUG_HIDDEN_LAST, 0);
+    r->spec_top_k = ds4_json_parse_optional_limit(body, 16);
+    return true;
+}
+
+
+static bool parse_debug_hidden_layers_request(ds4_engine *e, const char *body,
+                                              int def_tokens, int ctx_size,
+                                              request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEBUG_HIDDEN_LAYERS, 0);
+    r->spec_top_k = ds4_json_parse_optional_limit(body, 8);
+    return true;
+}
+
+
+static bool parse_debug_hidden_sequence_request(ds4_engine *e, const char *body,
+                                                int def_tokens, int ctx_size,
+                                                request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEBUG_HIDDEN_SEQUENCE, 0);
+    r->spec_top_k = ds4_json_parse_optional_limit(body, 8);
+    return true;
+}
+
+
+static bool parse_debug_last_hidden_sequence_request(ds4_engine *e, const char *body,
+                                                     int def_tokens, int ctx_size,
+                                                     request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEBUG_LAST_HIDDEN_SEQUENCE, 0);
+    r->spec_top_k = ds4_json_parse_optional_limit(body, 8);
+    return true;
+}
+
+
+static bool parse_deepspec_dump_sequence_request(ds4_engine *e, const char *body,
+                                                 int def_tokens, int ctx_size,
+                                                 request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)body;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEEPSPEC_DUMP_SEQUENCE, 0);
+    return true;
+}
+
+
+static bool parse_deepspec_reset_sample_request(ds4_engine *e, const char *body,
+                                                int def_tokens, int ctx_size,
+                                                request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)body;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEEPSPEC_RESET_SAMPLE, 0);
+    return true;
+}
+
+
+static char *ds4_json_parse_optional_string_field(const char *body, const char *key_name) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key_name);
+    const char *key = strstr(body ? body : "", needle);
+    if (!key) return NULL;
+
+    const char *p = strchr(key, ':');
+    if (!p) return NULL;
+    p++;
+    json_ws(&p);
+
+    char *out = NULL;
+    if (!json_string(&p, &out)) return NULL;
+    return out;
+}
+
+static bool ds4_json_parse_optional_bool_field(const char *body,
+                                                const char *key_name,
+                                                bool def_value) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key_name);
+    const char *key = strstr(body ? body : "", needle);
+    if (!key) return def_value;
+    const char *p = strchr(key, ':');
+    if (!p) return def_value;
+    p++;
+    json_ws(&p);
+    bool value = def_value;
+    return json_bool(&p, &value) ? value : def_value;
+}
+
+
+
+static bool parse_deepspec_generate_dflash_request(ds4_engine *e, const char *body,
+                                                   int def_tokens, int ctx_size,
+                                                   request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    int max_tokens = ds4_json_parse_optional_max_tokens_ds12(body, 1);
+    request_init(r, REQ_DS4_DEEPSPEC_GENERATE_DFLASH, max_tokens);
+    r->think_mode = DS4_THINK_NONE;
+    r->spec_top_k = ds4_json_parse_optional_limit(body, 8);
+
+    const char *temperature_key =
+        strstr(body ? body : "", "\"temperature\"");
+    if (temperature_key) {
+        const char *p = strchr(temperature_key, 58);
+        double value = 0.0;
+        if (!p) {
+            snprintf(err, errlen, "invalid DFlash temperature");
+            request_free(r);
+            return false;
+        }
+        p++;
+        if (!json_number(&p, &value) || value < 0.0) {
+            snprintf(err, errlen, "invalid DFlash temperature");
+            request_free(r);
+            return false;
+        }
+        r->temperature = (float)value;
+    }
+
+    const char *seed_key = strstr(body ? body : "", "\"seed\"");
+    if (seed_key) {
+        const char *p = strchr(seed_key, 58);
+        double value = 0.0;
+        if (!p) {
+            snprintf(err, errlen, "invalid DFlash seed");
+            request_free(r);
+            return false;
+        }
+        p++;
+        if (!json_number(&p, &value) || value < 0.0) {
+            snprintf(err, errlen, "invalid DFlash seed");
+            request_free(r);
+            return false;
+        }
+        r->seed = value > 0.0 ? (uint64_t)value : 0;
+    }
+    r->ds4_return_runtime_metrics = ds4_json_parse_optional_bool_field(
+        body, "ds4_return_runtime_metrics", false);
+    r->ds4_return_token_ids = ds4_json_parse_optional_bool_field(
+        body, "ds4_return_token_ids", false);
+    return true;
+}
+
+
+static bool parse_deepspec_draft_verify_once_request(ds4_engine *e, const char *body,
+                                                     int def_tokens, int ctx_size,
+                                                     request *r, char *err, size_t errlen) {
+    (void)e;
+    (void)def_tokens;
+    (void)ctx_size;
+    (void)err;
+    (void)errlen;
+    request_init(r, REQ_DS4_DEEPSPEC_DRAFT_VERIFY_ONCE, 0);
+    r->spec_top_k = ds4_json_parse_optional_limit(body, 8);
+    return true;
+}
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -2737,6 +3154,16 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
         } else if (!strcmp(key, "stream_options")) {
             if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "ds4_return_runtime_metrics")) {
+            if (!json_bool(&p, &r->ds4_return_runtime_metrics)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "ds4_return_token_ids")) {
+            if (!json_bool(&p, &r->ds4_return_token_ids)) {
                 free(key);
                 goto bad;
             }
@@ -2929,6 +3356,16 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "ds4_return_runtime_metrics")) {
+            if (!json_bool(&p, &r->ds4_return_runtime_metrics)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "ds4_return_token_ids")) {
+            if (!json_bool(&p, &r->ds4_return_token_ids)) {
                 free(key);
                 goto bad;
             }
@@ -4068,6 +4505,16 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
         } else if (!strcmp(key, "stream_options")) {
             if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "ds4_return_runtime_metrics")) {
+            if (!json_bool(&p, &r->ds4_return_runtime_metrics)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "ds4_return_token_ids")) {
+            if (!json_bool(&p, &r->ds4_return_token_ids)) {
                 free(key);
                 goto bad;
             }
@@ -6789,10 +7236,52 @@ static bool responses_final_response(int fd, bool enable_cors,
     return ok;
 }
 
+static void append_runtime_token_ids(buf *b, const ds4_tokens *tokens) {
+    buf_putc(b, '[');
+    for (int i = 0; tokens && i < tokens->len; i++) {
+        if (i) buf_putc(b, ',');
+        buf_printf(b, "%d", tokens->v[i]);
+    }
+    buf_putc(b, ']');
+}
+
+static void append_target_runtime_json(buf *b, const request *r,
+                                       const ds4_tokens *committed,
+                                       int prompt_tokens, int completion_tokens,
+                                       const char *finish, int eos_token,
+                                       double request_t0, double first_commit_t,
+                                       double last_commit_t, double response_t) {
+    if (!r->ds4_return_runtime_metrics && !r->ds4_return_token_ids) return;
+    double ttft_ms = first_commit_t >= request_t0 ? (first_commit_t - request_t0) * 1000.0 : 0.0;
+    double decode_ms = last_commit_t >= first_commit_t ? (last_commit_t - first_commit_t) * 1000.0 : 0.0;
+    double total_ms = response_t >= request_t0 ? (response_t - request_t0) * 1000.0 : 0.0;
+    double tokens_per_second = completion_tokens > 1 && decode_ms > 0.0 ?
+        (double)(completion_tokens - 1) * 1000.0 / decode_ms : 0.0;
+    buf_puts(b, ",\"ds4_runtime\":{\"schema\":\"ds4_runtime_generation_v1\","
+                "\"mode\":\"target_only\",\"token_id_provenance\":\"native_commit_path\","
+                "\"completion_token_ids\":");
+    append_runtime_token_ids(b, committed);
+    buf_puts(b, ",\"completion_token_count\":"); buf_printf(b, "%d", completion_tokens);
+    buf_puts(b, ",\"prompt_token_count\":"); buf_printf(b, "%d", prompt_tokens);
+    buf_puts(b, ",\"finish_reason\":"); json_escape(b, finish ? finish : "error");
+    buf_puts(b, ",\"eos_token_id\":"); buf_printf(b, "%d", eos_token);
+    buf_puts(b, ",\"stop_reason\":"); json_escape(b, finish ? finish : "error");
+    buf_puts(b, ",\"prompt_processing_ms\":"); buf_printf(b, "%.3f", ttft_ms);
+    buf_puts(b, ",\"ttft_ms\":"); buf_printf(b, "%.3f", ttft_ms);
+    buf_puts(b, ",\"decode_ms\":"); buf_printf(b, "%.3f", decode_ms);
+    buf_puts(b, ",\"total_generation_ms\":"); buf_printf(b, "%.3f", total_ms);
+    buf_puts(b, ",\"generation_tokens_per_second\":"); buf_printf(b, "%.6f", tokens_per_second);
+    buf_puts(b, ",\"proposed_draft_tokens\":0,\"accepted_draft_tokens\":0,"
+                "\"accepted_tokens_per_block\":0.0,\"cycles\":0,\"fallback_reason\":null}");
+}
+
 static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens) {
+                           int prompt_tokens, int completion_tokens,
+                           const ds4_tokens *committed, int eos_token,
+                           double request_t0, double first_commit_t,
+                           double last_commit_t, double response_t) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -6821,6 +7310,9 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_target_runtime_json(&b, r, committed, prompt_tokens, completion_tokens,
+                               finish, eos_token, request_t0, first_commit_t,
+                               last_commit_t, response_t);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -8812,6 +9304,8 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+static bool g_deepspec_disable_kv_load_for_capture = false;
+
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
@@ -8819,6 +9313,12 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (g_deepspec_disable_kv_load_for_capture) {
+        (void)effective_prompt;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: DeepSpec capture mode bypassed kv cache load");
+        return 0;
+    }
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
@@ -9988,7 +10488,1797 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+
+
+static bool ds4_json_parse_float_array16(const char *body, const char *key_name,
+                                         double *out, int *out_n,
+                                         int max_n,
+                                         char *err, size_t errlen) {
+    const char *q = ds4_json_find_array_after_key(body, key_name);
+    if (!q) {
+        snprintf(err, errlen, "missing %s", key_name);
+        return false;
+    }
+    q++;
+
+    int n = 0;
+    for (;;) {
+        while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+        if (*q == ']') {
+            q++;
+            break;
+        }
+        if (n >= max_n) {
+            snprintf(err, errlen, "%s too long; max %d", key_name, max_n);
+            return false;
+        }
+
+        char *end = NULL;
+        double v = strtod(q, &end);
+        if (end == q || !isfinite(v) || v < 0.0) {
+            snprintf(err, errlen, "invalid probability in %s", key_name);
+            return false;
+        }
+        out[n++] = v;
+        q = end;
+
+        while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+        if (*q == ',') {
+            q++;
+            continue;
+        }
+        if (*q == ']') {
+            q++;
+            break;
+        }
+
+        snprintf(err, errlen, "expected comma or closing bracket in %s", key_name);
+        return false;
+    }
+
+    if (out_n) *out_n = n;
+    return true;
+}
+
+
+static double ds4_json_parse_optional_double(const char *body, const char *key_name, double def_value) {
+    char needle[96];
+    snprintf(needle, sizeof(needle), "\"%s\"", key_name);
+    const char *key = strstr(body ? body : "", needle);
+    if (!key) return def_value;
+    const char *q = strchr(key, ':');
+    if (!q) return def_value;
+    q++;
+    while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+    char *end = NULL;
+    double v = strtod(q, &end);
+    if (end == q || !isfinite(v)) return def_value;
+    return v;
+}
+
+
+static double ds4_dflash_uniform01(void) {
+    unsigned char bytes[8];
+    uint64_t x = 0;
+    if (random_bytes(bytes, sizeof(bytes))) {
+        memcpy(&x, bytes, sizeof(x));
+    } else {
+        x = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid() ^ (uint64_t)(uintptr_t)&x;
+    }
+    /* Keep 53 random bits for a stable IEEE double in [0,1). */
+    x >>= 11;
+    return (double)x * (1.0 / 9007199254740992.0);
+}
+
+
+static double __attribute__((unused)) ds4_dflash_token_prob_from_session(ds4_session *session,
+                                                   int token,
+                                                   double temperature,
+                                                   double *logprob_out) {
+    enum { DS4_DFLASH_VOCAB_CAP_DEFAULT = 262144 };
+
+    int cap = DS4_DFLASH_VOCAB_CAP_DEFAULT;
+    const char *env_cap = getenv("DS4_DEEPSPEC_DFLASH_VOCAB_CAP");
+    if (env_cap && env_cap[0]) {
+        char *end = NULL;
+        long v = strtol(env_cap, &end, 10);
+        if (end != env_cap && v > 0 && v < 1048576) cap = (int)v;
+    }
+
+    if (!session || token < 0 || token >= cap) return 0.0;
+
+    float *logits = xmalloc((size_t)cap * sizeof(logits[0]));
+    int vocab_n = ds4_session_copy_logits(session, logits, cap);
+    if (vocab_n <= 0 || token >= vocab_n) {
+        free(logits);
+        return 0.0;
+    }
+
+    if (!(temperature > 0.0)) temperature = 1.0;
+
+    double max_logit = -INFINITY;
+    for (int i = 0; i < vocab_n; i++) {
+        double v = (double)logits[i] / temperature;
+        if (isfinite(v) && v > max_logit) max_logit = v;
+    }
+
+    if (!isfinite(max_logit)) {
+        free(logits);
+        return 0.0;
+    }
+
+    double sum = 0.0;
+    for (int i = 0; i < vocab_n; i++) {
+        double v = (double)logits[i] / temperature;
+        if (isfinite(v)) sum += exp(v - max_logit);
+    }
+
+    double lp = ((double)logits[token] / temperature) - (max_logit + log(sum));
+    double prob = exp(lp);
+
+    if (logprob_out) *logprob_out = lp;
+    free(logits);
+    return prob;
+}
+
+
+static void ds4_append_int_array_json(buf *b, const int *v, int n) {
+    buf_putc(b, '[');
+    for (int i = 0; i < n; i++) {
+        if (i) buf_putc(b, ',');
+        buf_printf(b, "%d", v[i]);
+    }
+    buf_putc(b, ']');
+}
+
+
+static void ds4_append_double_array_json(buf *b, const double *v, int n) {
+    buf_putc(b, '[');
+    for (int i = 0; i < n; i++) {
+        if (i) buf_putc(b, ',');
+        buf_printf(b, "%.17g", v[i]);
+    }
+    buf_putc(b, ']');
+}
+
+
+
+/* DS4 DS-11d residual helpers start */
+static int ds4_dflash_vocab_cap(void) {
+    int cap = 262144;
+    const char *env_cap = getenv("DS4_DEEPSPEC_DFLASH_VOCAB_CAP");
+    if (env_cap && env_cap[0]) {
+        char *end = NULL;
+        long v = strtol(env_cap, &end, 10);
+        if (end != env_cap && v > 0 && v < 1048576) cap = (int)v;
+    }
+    return cap;
+}
+
+static char *ds4_json_parse_optional_string_dup(const char *body, const char *key_name) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key_name);
+    const char *key = strstr(body ? body : "", needle);
+    if (!key) return NULL;
+    const char *q = strchr(key, ':');
+    if (!q) return NULL;
+    q++;
+    while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
+    if (*q != '"') return NULL;
+    q++;
+
+    size_t cap = strlen(q) + 1;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t n = 0;
+    while (*q && *q != '"') {
+        if (*q == '\\' && q[1]) {
+            q++;
+            if (*q == 'n') out[n++] = '\n';
+            else if (*q == 'r') out[n++] = '\r';
+            else if (*q == 't') out[n++] = '\t';
+            else out[n++] = *q;
+            q++;
+            continue;
+        }
+        out[n++] = *q++;
+    }
+    out[n] = '\0';
+    return out;
+}
+
+static int ds4_dflash_copy_target_probs(ds4_session *session,
+                                        double temperature,
+                                        double **probs_out,
+                                        int *vocab_out,
+                                        char *err,
+                                        size_t errlen) {
+    if (probs_out) *probs_out = NULL;
+    if (vocab_out) *vocab_out = 0;
+    if (!session || !probs_out || !vocab_out) {
+        if (err && errlen) snprintf(err, errlen, "invalid target prob args");
+        return 0;
+    }
+    if (!(temperature > 0.0) || !isfinite(temperature)) temperature = 1.0;
+
+    const int cap = ds4_dflash_vocab_cap();
+    float *logits = malloc((size_t)cap * sizeof(logits[0]));
+    if (!logits) {
+        if (err && errlen) snprintf(err, errlen, "alloc logits failed");
+        return 0;
+    }
+    int vocab_n = ds4_session_copy_logits(session, logits, cap);
+    if (vocab_n <= 0 || vocab_n > cap) {
+        free(logits);
+        if (err && errlen) snprintf(err, errlen, "copy logits failed");
+        return 0;
+    }
+
+    double max_logit = -INFINITY;
+    for (int i = 0; i < vocab_n; i++) {
+        double v = (double)logits[i] / temperature;
+        if (isfinite(v) && v > max_logit) max_logit = v;
+    }
+    if (!isfinite(max_logit)) {
+        free(logits);
+        if (err && errlen) snprintf(err, errlen, "target logits are not finite");
+        return 0;
+    }
+
+    double *probs = malloc((size_t)vocab_n * sizeof(probs[0]));
+    if (!probs) {
+        free(logits);
+        if (err && errlen) snprintf(err, errlen, "alloc probs failed");
+        return 0;
+    }
+
+    double sum = 0.0;
+    for (int i = 0; i < vocab_n; i++) {
+        double v = (double)logits[i] / temperature;
+        double p = isfinite(v) ? exp(v - max_logit) : 0.0;
+        probs[i] = p;
+        sum += p;
+    }
+    free(logits);
+
+    if (!(sum > 0.0) || !isfinite(sum)) {
+        free(probs);
+        if (err && errlen) snprintf(err, errlen, "target prob sum failed");
+        return 0;
+    }
+    for (int i = 0; i < vocab_n; i++) probs[i] /= sum;
+
+    *probs_out = probs;
+    *vocab_out = vocab_n;
+    return 1;
+}
+
+static float *ds4_dflash_load_draft_probs_file(const char *path,
+                                               int n_slots,
+                                               int vocab_n,
+                                               char *err,
+                                               size_t errlen) {
+    if (!path || !path[0] || n_slots <= 0 || vocab_n <= 0) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (err && errlen) snprintf(err, errlen, "open draft_probs_file failed");
+        return NULL;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        if (err && errlen) snprintf(err, errlen, "seek draft_probs_file failed");
+        return NULL;
+    }
+    long file_bytes_long = ftell(f);
+    if (file_bytes_long < 0) {
+        fclose(f);
+        if (err && errlen) snprintf(err, errlen, "tell draft_probs_file failed");
+        return NULL;
+    }
+    rewind(f);
+
+    const size_t file_bytes = (size_t)file_bytes_long;
+    if (file_bytes == 0 || (file_bytes % sizeof(float)) != 0) {
+        fclose(f);
+        if (err && errlen) snprintf(err, errlen, "draft_probs_file size is not float-aligned");
+        return NULL;
+    }
+
+    const size_t file_floats = file_bytes / sizeof(float);
+    if ((file_floats % (size_t)n_slots) != 0) {
+        fclose(f);
+        if (err && errlen) snprintf(err, errlen, "draft_probs_file float count not divisible by n_slots");
+        return NULL;
+    }
+
+    const size_t file_vocab_n = file_floats / (size_t)n_slots;
+    const size_t dst_vocab_n = (size_t)vocab_n;
+    const size_t copy_vocab_n = file_vocab_n < dst_vocab_n ? file_vocab_n : dst_vocab_n;
+    const size_t dst_count = (size_t)n_slots * dst_vocab_n;
+
+    float *src = malloc(file_floats * sizeof(src[0]));
+    if (!src) {
+        fclose(f);
+        if (err && errlen) snprintf(err, errlen, "alloc draft_probs src failed");
+        return NULL;
+    }
+    size_t got = fread(src, sizeof(src[0]), file_floats, f);
+    fclose(f);
+    if (got != file_floats) {
+        free(src);
+        if (err && errlen) snprintf(err, errlen, "read draft_probs_file failed");
+        return NULL;
+    }
+
+    float *bufp = calloc(dst_count, sizeof(bufp[0]));
+    if (!bufp) {
+        free(src);
+        if (err && errlen) snprintf(err, errlen, "alloc draft_probs failed");
+        return NULL;
+    }
+
+    for (int slot = 0; slot < n_slots; slot++) {
+        const float *src_slot = src + (size_t)slot * file_vocab_n;
+        float *dst_slot = bufp + (size_t)slot * dst_vocab_n;
+        memcpy(dst_slot, src_slot, copy_vocab_n * sizeof(dst_slot[0]));
+    }
+
+    free(src);
+    return bufp;
+}
+
+static int ds4_dflash_sample_distribution(const double *p, int n, double *u_out) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) if (p[i] > 0.0 && isfinite(p[i])) sum += p[i];
+    if (!(sum > 0.0) || !isfinite(sum)) return -1;
+    double u = ds4_dflash_uniform01();
+    if (u_out) *u_out = u;
+    double r = u * sum;
+    double c = 0.0;
+    int last = -1;
+    for (int i = 0; i < n; i++) {
+        if (p[i] > 0.0 && isfinite(p[i])) {
+            c += p[i];
+            last = i;
+            if (r <= c) return i;
+        }
+    }
+    return last;
+}
+
+static int ds4_dflash_sample_residual_distribution(const double *target_probs,
+                                                   const float *draft_probs,
+                                                   int vocab_n,
+                                                   double *residual_sum_out,
+                                                   double *u_out) {
+    double *residual = malloc((size_t)vocab_n * sizeof(residual[0]));
+    if (!residual) return -1;
+    double sum = 0.0;
+    for (int i = 0; i < vocab_n; i++) {
+        double d = draft_probs ? (double)draft_probs[i] : 0.0;
+        double r = target_probs[i] - d;
+        if (!(r > 0.0) || !isfinite(r)) r = 0.0;
+        residual[i] = r;
+        sum += r;
+    }
+    if (residual_sum_out) *residual_sum_out = sum;
+    int tok = -1;
+    if (sum > 0.0 && isfinite(sum)) tok = ds4_dflash_sample_distribution(residual, vocab_n, u_out);
+    free(residual);
+    return tok;
+}
+/* DS4 DS-11d residual helpers end */
+
+
+static long long ds4_dflash_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+typedef struct {
+    int committed[256];
+    int verified_tokens[256];
+    int target_argmax_tokens[256];
+    double target_argmax_probs[256];
+    int draft_matches_target_argmax[256];
+    double draft_prob_of_target_argmax[256];
+    int draft_rank_of_target_argmax[256];
+    int draft_top1_token_ids[256];
+    double draft_top1_probs[256];
+    int committed_n;
+    int accepted_n;
+    int tried_n;
+    double target_token_probs[256];
+    double accept_probs[256];
+    double accept_randoms[256];
+    double residual_sums[256];
+    int fallback_tokens[256];
+    bool residual_enabled;
+    int position;
+    long long timing_target_probs_ms;
+    long long timing_draft_probs_load_ms;
+    long long timing_verify_total_ms;
+} ds4_dflash_verify_result;
+
+static void ds4_dflash_verify_result_init(ds4_dflash_verify_result *r) {
+    if (!r) return;
+    memset(r, 0, sizeof(*r));
+    for (int i = 0; i < 256; i++) {
+        r->target_token_probs[i] = 0.0;
+        r->accept_probs[i] = 0.0;
+        r->accept_randoms[i] = 0.0;
+        r->residual_sums[i] = 0.0;
+        r->fallback_tokens[i] = -1;
+        r->committed[i] = -1;
+        r->verified_tokens[i] = -1;
+        r->target_argmax_tokens[i] = -1;
+        r->target_argmax_probs[i] = 0.0;
+        r->draft_matches_target_argmax[i] = 0;
+        r->draft_prob_of_target_argmax[i] = 0.0;
+        r->draft_rank_of_target_argmax[i] = -1;
+        r->draft_top1_token_ids[i] = -1;
+        r->draft_top1_probs[i] = 0.0;
+    }
+    r->position = -1;
+}
+
+static int ds4_dflash_verify_and_commit(server *s,
+                                        const int *draft_tokens,
+                                        const double *draft_token_probs,
+                                        int n_draft,
+                                        const char *draft_probs_file,
+                                        double temperature,
+                                        int max_commit,
+                                        bool add_next_target,
+                                        ds4_dflash_verify_result *out,
+                                        char *err,
+                                        size_t errlen) {
+    if (err && errlen) err[0] = 0;
+    if (!s || !s->session || !draft_tokens || !draft_token_probs || !out) {
+        if (err && errlen) snprintf(err, errlen, "invalid dflash verify args");
+        return 0;
+    }
+    if (n_draft <= 0 || n_draft > 256) {
+        if (err && errlen) snprintf(err, errlen, "draft_token_ids must not be empty");
+        return 0;
+    }
+    if (max_commit <= 0) max_commit = 1;
+    if (max_commit > 256) max_commit = 256;
+    const bool greedy = temperature <= 0.0;
+    if (!isfinite(temperature)) temperature = 1.0;
+    const double probability_temperature = greedy ? 1.0 : temperature;
+
+    ds4_dflash_verify_result_init(out);
+    long long ds14c_verify_t0_ms = ds4_dflash_now_ms();
+
+    const bool residual_enabled = draft_probs_file && draft_probs_file[0];
+    out->residual_enabled = residual_enabled;
+
+    double *target_probs = NULL;
+    int vocab_n = 0;
+    long long ds14c_target_t0_ms = ds4_dflash_now_ms();
+    if (!ds4_dflash_copy_target_probs(s->session, probability_temperature, &target_probs, &vocab_n, err, errlen)) {
+        out->timing_target_probs_ms += ds4_dflash_now_ms() - ds14c_target_t0_ms;
+        out->timing_verify_total_ms = ds4_dflash_now_ms() - ds14c_verify_t0_ms;
+        return 0;
+    }
+    out->timing_target_probs_ms += ds4_dflash_now_ms() - ds14c_target_t0_ms;
+
+    float *draft_probs_full = NULL;
+    if (residual_enabled) {
+        long long ds14c_load_t0_ms = ds4_dflash_now_ms();
+        draft_probs_full = ds4_dflash_load_draft_probs_file(draft_probs_file, n_draft, vocab_n, err, errlen);
+        out->timing_draft_probs_load_ms += ds4_dflash_now_ms() - ds14c_load_t0_ms;
+        if (!draft_probs_full) {
+            free(target_probs);
+            out->timing_verify_total_ms = ds4_dflash_now_ms() - ds14c_verify_t0_ms;
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < n_draft && out->committed_n < max_commit; i++) {
+        if (!target_probs) {
+            long long ds14c_target_loop_t0_ms = ds4_dflash_now_ms();
+            if (!ds4_dflash_copy_target_probs(s->session, probability_temperature, &target_probs, &vocab_n, err, errlen)) {
+                out->timing_target_probs_ms += ds4_dflash_now_ms() - ds14c_target_loop_t0_ms;
+                free(draft_probs_full);
+                out->timing_verify_total_ms = ds4_dflash_now_ms() - ds14c_verify_t0_ms;
+                return 0;
+            }
+            out->timing_target_probs_ms += ds4_dflash_now_ms() - ds14c_target_loop_t0_ms;
+        }
+
+        int draft = draft_tokens[i];
+        double draft_prob_raw = draft_token_probs[i];
+
+        int target_best_tok = -1;
+        double target_best_prob = -1.0;
+        for (int vi = 0; vi < vocab_n; vi++) {
+            const double p = target_probs[vi];
+            if (isfinite(p) && p > target_best_prob) {
+                target_best_prob = p;
+                target_best_tok = vi;
+            }
+        }
+        if (draft < 0 || draft >= vocab_n) {
+            free(target_probs);
+            free(draft_probs_full);
+            if (err && errlen) snprintf(err, errlen, "draft token outside vocab");
+            return 0;
+        }
+
+        const double draft_prob = draft_prob_raw > 1e-12 ? draft_prob_raw : 1e-12;
+        const double target_prob = target_probs[draft];
+        double accept_prob = greedy
+            ? (draft == target_best_tok ? 1.0 : 0.0)
+            : target_prob / draft_prob;
+        if (!isfinite(accept_prob) || accept_prob < 0.0) accept_prob = 0.0;
+        if (accept_prob > 1.0) accept_prob = 1.0;
+
+        double draft_prob_target_argmax = 0.0;
+        int draft_rank_target_argmax = -1;
+        int draft_top1_tok = -1;
+        double draft_top1_prob = -1.0;
+        if (draft_probs_full && target_best_tok >= 0) {
+            const float *rank_slot = draft_probs_full + (size_t)i * (size_t)vocab_n;
+            draft_prob_target_argmax = rank_slot[target_best_tok];
+            int better = 0;
+            for (int vi = 0; vi < vocab_n; vi++) {
+                const double dp = rank_slot[vi];
+                if (isfinite(dp) && dp > draft_top1_prob) {
+                    draft_top1_prob = dp;
+                    draft_top1_tok = vi;
+                }
+                if (isfinite(dp) && dp > draft_prob_target_argmax) better++;
+            }
+            draft_rank_target_argmax = better + 1;
+        }
+
+        const double u = ds4_dflash_uniform01();
+        const int tried_idx = out->tried_n;
+        if (tried_idx < 256) {
+            out->verified_tokens[tried_idx] = draft;
+            out->target_argmax_tokens[tried_idx] = target_best_tok;
+            out->target_argmax_probs[tried_idx] = target_best_prob;
+            out->draft_matches_target_argmax[tried_idx] = (draft == target_best_tok) ? 1 : 0;
+            out->draft_prob_of_target_argmax[tried_idx] = draft_prob_target_argmax;
+            out->draft_rank_of_target_argmax[tried_idx] = draft_rank_target_argmax;
+            out->draft_top1_token_ids[tried_idx] = draft_top1_tok;
+            out->draft_top1_probs[tried_idx] = draft_top1_prob;
+            out->target_token_probs[tried_idx] = target_prob;
+            out->accept_probs[tried_idx] = accept_prob;
+            out->accept_randoms[tried_idx] = u;
+        }
+
+        if (u >= accept_prob) {
+            int fallback = -1;
+            if (!greedy && residual_enabled && draft_probs_full) {
+                double ru = 0.0;
+                const float *draft_slot = draft_probs_full + (size_t)i * (size_t)vocab_n;
+                fallback = ds4_dflash_sample_residual_distribution(target_probs,
+                                                                    draft_slot,
+                                                                    vocab_n,
+                                                                    tried_idx < 256 ? &out->residual_sums[tried_idx] : NULL,
+                                                                    &ru);
+            }
+            if (fallback < 0) fallback = target_best_tok;
+            if (fallback < 0) fallback = ds4_session_argmax(s->session);
+            if (fallback < 0) {
+                free(target_probs);
+                free(draft_probs_full);
+                if (err && errlen) snprintf(err, errlen, "target fallback failed");
+                return 0;
+            }
+
+            if (tried_idx < 256) out->fallback_tokens[tried_idx] = fallback;
+            out->tried_n++;
+
+            out->committed[out->committed_n++] = fallback;
+
+            if (fallback != ds4_token_eos(s->engine)) {
+                if (ds4_session_eval(s->session, fallback, err, errlen) != 0) {
+                    free(target_probs);
+                    free(draft_probs_full);
+                    if (err && errlen && !err[0]) snprintf(err, errlen, "fallback eval failed");
+                    return 0;
+                }
+            }
+
+            free(target_probs);
+            target_probs = NULL;
+            break;
+        }
+
+        out->tried_n++;
+        out->committed[out->committed_n++] = draft;
+        out->accepted_n++;
+
+        free(target_probs);
+        target_probs = NULL;
+
+        if (draft == ds4_token_eos(s->engine)) break;
+
+        if (ds4_session_eval(s->session, draft, err, errlen) != 0) {
+            free(draft_probs_full);
+            if (err && errlen && !err[0]) snprintf(err, errlen, "draft token eval failed");
+            return 0;
+        }
+    }
+
+    if (add_next_target &&
+        out->accepted_n == n_draft &&
+        out->committed_n < max_commit) {
+        double *next_probs = NULL;
+        int next_vocab_n = 0;
+        int next_target = -1;
+        long long ds14c_next_target_t0_ms = ds4_dflash_now_ms();
+        if (!greedy && ds4_dflash_copy_target_probs(s->session, probability_temperature, &next_probs, &next_vocab_n, err, errlen)) {
+            out->timing_target_probs_ms += ds4_dflash_now_ms() - ds14c_next_target_t0_ms;
+            next_target = ds4_dflash_sample_distribution(next_probs, next_vocab_n, NULL);
+            free(next_probs);
+        } else {
+            out->timing_target_probs_ms += ds4_dflash_now_ms() - ds14c_next_target_t0_ms;
+        }
+        if (next_target < 0) next_target = ds4_session_argmax(s->session);
+        if (next_target < 0) {
+            free(target_probs);
+            free(draft_probs_full);
+            if (err && errlen) snprintf(err, errlen, "next target failed");
+            return 0;
+        }
+
+        out->committed[out->committed_n++] = next_target;
+
+        if (next_target != ds4_token_eos(s->engine)) {
+            if (ds4_session_eval(s->session, next_target, err, errlen) != 0) {
+                free(target_probs);
+                free(draft_probs_full);
+                if (err && errlen && !err[0]) snprintf(err, errlen, "next target eval failed");
+                return 0;
+            }
+        }
+    }
+
+    free(target_probs);
+    free(draft_probs_full);
+
+    out->position = ds4_session_pos(s->session);
+    return 1;
+}
+
+static void generate_spec_verify_dflash_job(server *s, job *j) {
+    char err[256];
+    err[0] = 0;
+
+    const int n_draft = j->req.spec_draft_n;
+    if (n_draft <= 0) {
+        http_error(j->fd, s->enable_cors, 400, "draft_token_ids must not be empty");
+        return;
+    }
+
+    double draft_token_probs[16];
+    int n_probs = 0;
+    if (!ds4_json_parse_float_array16(j->req.raw_body,
+                                      "draft_token_probs",
+                                      draft_token_probs,
+                                      &n_probs,
+                                      (int)(sizeof(draft_token_probs) / sizeof(draft_token_probs[0])),
+                                      err,
+                                      sizeof(err))) {
+        http_error(j->fd, s->enable_cors, 400, err[0] ? err : "missing draft_token_probs");
+        return;
+    }
+
+    if (n_probs != n_draft) {
+        http_error(j->fd, s->enable_cors, 400, "draft_token_probs length must match draft_token_ids");
+        return;
+    }
+
+    double temperature = ds4_json_parse_optional_double(j->req.raw_body, "temperature", 1.0);
+    if (!(temperature > 0.0) || !isfinite(temperature)) temperature = 1.0;
+
+    char *draft_probs_file = ds4_json_parse_optional_string_dup(j->req.raw_body, "draft_probs_file");
+
+    ds4_dflash_verify_result vr;
+    ds4_dflash_verify_result_init(&vr);
+
+    if (!ds4_dflash_verify_and_commit(s,
+                                      j->req.spec_draft_tokens,
+                                      draft_token_probs,
+                                      n_draft,
+                                      draft_probs_file,
+                                      temperature,
+                                      17,
+                                      true,
+                                      &vr,
+                                      err,
+                                      sizeof(err))) {
+        int code = 500;
+        if (strstr(err, "draft token outside vocab") ||
+            strstr(err, "draft_probs_file") ||
+            strstr(err, "draft_token_ids")) {
+            code = 400;
+        }
+        free(draft_probs_file);
+        http_error(j->fd, s->enable_cors, code, err[0] ? err : "dflash verify failed");
+        return;
+    }
+
+    buf body = {0};
+    buf_puts(&body, "{\"object\":\"ds4.spec_verify_dflash\",");
+    buf_puts(&body, "\"verify_mode\":\"dflash_rejection_sampling_residual\",");
+    buf_puts(&body, "\"temperature\":");
+    buf_printf(&body, "%.17g", temperature);
+    buf_puts(&body, ",\"draft_token_ids\":");
+    ds4_append_int_array_json(&body, j->req.spec_draft_tokens, n_draft);
+    buf_puts(&body, ",\"draft_token_probs\":");
+    ds4_append_double_array_json(&body, draft_token_probs, n_probs);
+    buf_puts(&body, ",\"verified_token_ids\":");
+    ds4_append_int_array_json(&body, vr.verified_tokens, vr.tried_n);
+    buf_puts(&body, ",\"target_argmax_token_ids\":");
+    ds4_append_int_array_json(&body, vr.target_argmax_tokens, vr.tried_n);
+    buf_puts(&body, ",\"target_argmax_probs\":");
+    ds4_append_double_array_json(&body, vr.target_argmax_probs, vr.tried_n);
+    buf_puts(&body, ",\"draft_matches_target_argmax\":");
+    ds4_append_int_array_json(&body, vr.draft_matches_target_argmax, vr.tried_n);
+    buf_puts(&body, ",\"draft_prob_of_target_argmax\":");
+    ds4_append_double_array_json(&body, vr.draft_prob_of_target_argmax, vr.tried_n);
+    buf_puts(&body, ",\"draft_rank_of_target_argmax\":");
+    ds4_append_int_array_json(&body, vr.draft_rank_of_target_argmax, vr.tried_n);
+    buf_puts(&body, ",\"draft_top1_token_ids\":");
+    ds4_append_int_array_json(&body, vr.draft_top1_token_ids, vr.tried_n);
+    buf_puts(&body, ",\"draft_top1_probs\":");
+    ds4_append_double_array_json(&body, vr.draft_top1_probs, vr.tried_n);
+    buf_puts(&body, ",\"target_token_probs\":");
+    ds4_append_double_array_json(&body, vr.target_token_probs, vr.tried_n);
+    buf_puts(&body, ",\"accept_probs\":");
+    ds4_append_double_array_json(&body, vr.accept_probs, vr.tried_n);
+    buf_puts(&body, ",\"accept_randoms\":");
+    ds4_append_double_array_json(&body, vr.accept_randoms, vr.tried_n);
+    buf_puts(&body, ",\"residual_sums\":");
+    ds4_append_double_array_json(&body, vr.residual_sums, vr.tried_n);
+    buf_puts(&body, ",\"fallback_token_ids\":");
+    ds4_append_int_array_json(&body, vr.fallback_tokens, vr.tried_n);
+    buf_puts(&body, ",\"accepted_draft_tokens\":");
+    buf_printf(&body, "%d", vr.accepted_n);
+    buf_puts(&body, ",\"committed_tokens\":");
+    buf_printf(&body, "%d", vr.committed_n);
+    buf_puts(&body, ",\"committed_token_ids\":");
+    ds4_append_int_array_json(&body, vr.committed, vr.committed_n);
+    buf_puts(&body, ",\"position\":");
+    buf_printf(&body, "%d", vr.position >= 0 ? vr.position : ds4_session_pos(s->session));
+    buf_puts(&body, ",\"residual_sampling\":");
+    buf_puts(&body, vr.residual_enabled ? "true" : "false");
+    buf_puts(&body, ",\"draft_probs_file\":");
+    if (draft_probs_file && draft_probs_file[0]) {
+        json_escape(&body, draft_probs_file);
+    } else {
+        buf_puts(&body, "null");
+    }
+    buf_puts(&body, ",\"ok\":true}");
+
+    free(draft_probs_file);
+    char *body_json = buf_take(&body);
+    http_response(j->fd, s->enable_cors, 200, "application/json", body_json ? body_json : "{}");
+    free(body_json);
+}
+
+static void generate_spec_verify_argmax_job(server *s, job *j) {
+    char err[160];
+    err[0] = '\0';
+
+    j->req.spec_committed_n = ds4_session_verify_draft_argmax(
+        s->session,
+        j->req.spec_draft_tokens,
+        j->req.spec_draft_n,
+        ds4_token_eos(s->engine),
+        j->req.spec_committed_tokens,
+        (int)(sizeof(j->req.spec_committed_tokens) / sizeof(j->req.spec_committed_tokens[0])),
+        &j->req.spec_accepted_draft_tokens,
+        err,
+        sizeof(err));
+
+    if (j->req.spec_committed_n < 0) {
+        http_error(j->fd, s->enable_cors, 500, err[0] ? err : "spec verify failed");
+        return;
+    }
+
+    char tokens[1024];
+    size_t off = 0;
+    tokens[off++] = '[';
+    for (int i = 0; i < j->req.spec_committed_n; i++) {
+        int n = snprintf(tokens + off, sizeof(tokens) - off,
+                         "%s%d", i ? "," : "", j->req.spec_committed_tokens[i]);
+        if (n < 0 || (size_t)n >= sizeof(tokens) - off) {
+            http_error(j->fd, s->enable_cors, 500, "spec response too large");
+            return;
+        }
+        off += (size_t)n;
+    }
+    if (off + 2 > sizeof(tokens)) {
+        http_error(j->fd, s->enable_cors, 500, "spec response too large");
+        return;
+    }
+    tokens[off++] = ']';
+    tokens[off] = '\0';
+
+    char body[1536];
+    snprintf(body, sizeof(body),
+             "{\"object\":\"ds4.spec_verify_argmax\","
+             "\"accepted_draft_tokens\":%d,"
+             "\"committed_tokens\":%d,"
+             "\"committed_token_ids\":%s,"
+             "\"position\":%d,"
+             "\"ok\":true}",
+             j->req.spec_accepted_draft_tokens,
+             j->req.spec_committed_n,
+             tokens,
+             ds4_session_pos(s->session));
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+}
+
+
+static void generate_spec_target_logprobs_job(server *s, job *j) {
+    int top_k = j->req.spec_top_k > 0 ? j->req.spec_top_k : 8;
+    if (top_k > 64) top_k = 64;
+
+
+    ds4_token_score top[64];
+    int got_top = ds4_session_top_logprobs(s->session, top, top_k);
+    int target_argmax = ds4_session_argmax(s->session);
+
+    char token_items[2048];
+    size_t token_off = 0;
+    token_items[token_off++] = '[';
+    for (int i = 0; i < j->req.spec_draft_n; i++) {
+        ds4_token_score sc;
+        memset(&sc, 0, sizeof(sc));
+        if (!ds4_session_token_logprob(s->session, j->req.spec_draft_tokens[i], &sc)) {
+            http_error(j->fd, s->enable_cors, 400, "invalid token id");
+            return;
+        }
+        int n = snprintf(token_items + token_off, sizeof(token_items) - token_off,
+                         "%s{\"token_id\":%d,\"logit\":%.9g,\"logprob\":%.9g}",
+                         i ? "," : "",
+                         sc.id,
+                         (double)sc.logit,
+                         (double)sc.logprob);
+        if (n < 0 || (size_t)n >= sizeof(token_items) - token_off) {
+            http_error(j->fd, s->enable_cors, 500, "token logprob response too large");
+            return;
+        }
+        token_off += (size_t)n;
+    }
+    if (token_off + 2 > sizeof(token_items)) {
+        http_error(j->fd, s->enable_cors, 500, "token logprob response too large");
+        return;
+    }
+    token_items[token_off++] = ']';
+    token_items[token_off] = '\0';
+
+    char top_items[8192];
+    size_t top_off = 0;
+    top_items[top_off++] = '[';
+    for (int i = 0; i < got_top; i++) {
+        int n = snprintf(top_items + top_off, sizeof(top_items) - top_off,
+                         "%s{\"token_id\":%d,\"logit\":%.9g,\"logprob\":%.9g}",
+                         i ? "," : "",
+                         top[i].id,
+                         (double)top[i].logit,
+                         (double)top[i].logprob);
+        if (n < 0 || (size_t)n >= sizeof(top_items) - top_off) {
+            http_error(j->fd, s->enable_cors, 500, "top logprob response too large");
+            return;
+        }
+        top_off += (size_t)n;
+    }
+    if (top_off + 2 > sizeof(top_items)) {
+        http_error(j->fd, s->enable_cors, 500, "top logprob response too large");
+        return;
+    }
+    top_items[top_off++] = ']';
+    top_items[top_off] = '\0';
+
+    char body[12288];
+    int n = snprintf(body, sizeof(body),
+                     "{\"object\":\"ds4.spec_target_logprobs\","
+                     "\"position\":%d,"
+                     "\"target_argmax\":%d,"
+                     "\"token_logprobs\":%s,"
+                     "\"top_logprobs\":%s,"
+                     "\"ok\":true}",
+                     ds4_session_pos(s->session),
+                     target_argmax,
+                     token_items,
+                     top_items);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        http_error(j->fd, s->enable_cors, 500, "logprob response too large");
+        return;
+    }
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+}
+
+
+static void generate_debug_hidden_last_job(server *s, job *j) {
+    int limit = j->req.spec_top_k > 0 ? j->req.spec_top_k : 16;
+    if (limit > 256) limit = 256;
+
+    int hidden_cap = ds4_session_hidden_dim();
+    if (hidden_cap <= 0) {
+        http_error(j->fd, s->enable_cors, 500, "invalid hidden dim");
+        return;
+    }
+    float *hidden = xmalloc((size_t)hidden_cap * sizeof(hidden[0]));
+    int dim = ds4_session_copy_last_hidden_norm(s->session, hidden, hidden_cap);
+    if (dim <= 0) {
+        free(hidden);
+        http_error(j->fd, s->enable_cors, 500, "last hidden export unavailable");
+        return;
+    }
+    if (limit > dim) limit = dim;
+
+    double sum = 0.0;
+    double sum2 = 0.0;
+    float minv = hidden[0];
+    float maxv = hidden[0];
+    for (int i = 0; i < dim; i++) {
+        const float v = hidden[i];
+        sum += (double)v;
+        sum2 += (double)v * (double)v;
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+    }
+    const double mean = sum / (double)dim;
+    const double rms = sqrt(sum2 / (double)dim);
+
+    char values[8192];
+    size_t off = 0;
+    values[off++] = '[';
+    for (int i = 0; i < limit; i++) {
+        int n = snprintf(values + off, sizeof(values) - off,
+                         "%s%.9g", i ? "," : "", (double)hidden[i]);
+        if (n < 0 || (size_t)n >= sizeof(values) - off) {
+            free(hidden);
+            http_error(j->fd, s->enable_cors, 500, "hidden response too large");
+            return;
+        }
+        off += (size_t)n;
+    }
+    if (off + 2 > sizeof(values)) {
+        free(hidden);
+        http_error(j->fd, s->enable_cors, 500, "hidden response too large");
+        return;
+    }
+    values[off++] = ']';
+    values[off] = '\0';
+
+    char body[12000];
+    int n = snprintf(body, sizeof(body),
+                     "{\"object\":\"ds4.debug_hidden_last\","
+                     "\"position\":%d,"
+                     "\"tensor\":\"output_norm\","
+                     "\"dtype\":\"float32\","
+                     "\"hidden_dim\":%d,"
+                     "\"values_count\":%d,"
+                     "\"values\":%s,"
+                     "\"stats\":{\"mean\":%.9g,\"rms\":%.9g,\"min\":%.9g,\"max\":%.9g},"
+                     "\"ok\":true}",
+                     ds4_session_pos(s->session),
+                     dim,
+                     limit,
+                     values,
+                     mean,
+                     rms,
+                     (double)minv,
+                     (double)maxv);
+    free(hidden);
+
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        http_error(j->fd, s->enable_cors, 500, "hidden response too large");
+        return;
+    }
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+}
+
+
+static void generate_debug_hidden_layers_job(server *s, job *j) {
+    int limit = j->req.spec_top_k > 0 ? j->req.spec_top_k : 8;
+    if (limit > 64) limit = 64;
+
+    int hidden_dim = ds4_session_hidden_dim();
+    if (hidden_dim <= 0) {
+        http_error(j->fd, s->enable_cors, 500, "invalid hidden dim");
+        return;
+    }
+
+    int layer_ids[16];
+    float *hidden = xmalloc((size_t)16 * (size_t)hidden_dim * sizeof(hidden[0]));
+    int position = -1;
+    int n_layers = ds4_session_copy_deepspec_layer_hidden_norms(
+        s->session,
+        layer_ids,
+        16,
+        hidden,
+        16 * hidden_dim,
+        &hidden_dim,
+        &position);
+
+    if (n_layers <= 0) {
+        free(hidden);
+        http_error(j->fd, s->enable_cors, 500,
+                   "DeepSpec layer hidden capture unavailable; set DS4_DEEPSPEC_CAPTURE_LAYERS=0,8,16 before starting server");
+        return;
+    }
+
+    char *body = xmalloc(65536);
+    size_t off = 0;
+    int n = snprintf(body + off, 65536 - off,
+                     "{\"object\":\"ds4.debug_hidden_layers\","
+                     "\"position\":%d,"
+                     "\"tensor\":\"ffn_norm\","
+                     "\"dtype\":\"float32\","
+                     "\"hidden_dim\":%d,"
+                     "\"layers\":[",
+                     position,
+                     hidden_dim);
+    if (n < 0 || (size_t)n >= 65536 - off) {
+        free(hidden);
+        free(body);
+        http_error(j->fd, s->enable_cors, 500, "hidden layers response too large");
+        return;
+    }
+    off += (size_t)n;
+
+    for (int li = 0; li < n_layers; li++) {
+        float *row = hidden + (uint64_t)li * hidden_dim;
+        double sum = 0.0;
+        double sum2 = 0.0;
+        float minv = row[0];
+        float maxv = row[0];
+        for (int i = 0; i < hidden_dim; i++) {
+            const float v = row[i];
+            sum += (double)v;
+            sum2 += (double)v * (double)v;
+            if (v < minv) minv = v;
+            if (v > maxv) maxv = v;
+        }
+        const double mean = sum / (double)hidden_dim;
+        const double rms = sqrt(sum2 / (double)hidden_dim);
+        int layer_limit = limit < hidden_dim ? limit : hidden_dim;
+
+        n = snprintf(body + off, 65536 - off,
+                     "%s{\"layer_id\":%d,"
+                     "\"values_count\":%d,"
+                     "\"values\":[",
+                     li ? "," : "",
+                     layer_ids[li],
+                     layer_limit);
+        if (n < 0 || (size_t)n >= 65536 - off) {
+            free(hidden);
+            free(body);
+            http_error(j->fd, s->enable_cors, 500, "hidden layers response too large");
+            return;
+        }
+        off += (size_t)n;
+
+        for (int i = 0; i < layer_limit; i++) {
+            n = snprintf(body + off, 65536 - off,
+                         "%s%.9g", i ? "," : "", (double)row[i]);
+            if (n < 0 || (size_t)n >= 65536 - off) {
+                free(hidden);
+                free(body);
+                http_error(j->fd, s->enable_cors, 500, "hidden layers response too large");
+                return;
+            }
+            off += (size_t)n;
+        }
+
+        n = snprintf(body + off, 65536 - off,
+                     "],\"stats\":{\"mean\":%.9g,\"rms\":%.9g,\"min\":%.9g,\"max\":%.9g}}",
+                     mean,
+                     rms,
+                     (double)minv,
+                     (double)maxv);
+        if (n < 0 || (size_t)n >= 65536 - off) {
+            free(hidden);
+            free(body);
+            http_error(j->fd, s->enable_cors, 500, "hidden layers response too large");
+            return;
+        }
+        off += (size_t)n;
+    }
+
+    n = snprintf(body + off, 65536 - off, "],\"ok\":true}");
+    if (n < 0 || (size_t)n >= 65536 - off) {
+        free(hidden);
+        free(body);
+        http_error(j->fd, s->enable_cors, 500, "hidden layers response too large");
+        return;
+    }
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+    free(hidden);
+    free(body);
+}
+
+
+static void generate_debug_hidden_sequence_job(server *s, job *j) {
+    int limit = j->req.spec_top_k > 0 ? j->req.spec_top_k : 8;
+    if (limit > 64) limit = 64;
+
+    int layer_ids[16];
+    int tokens_per_layer[16];
+    double stats[16 * 4];
+    float *last_values = xmalloc((size_t)16 * (size_t)limit * sizeof(last_values[0]));
+    int seq_len = 0;
+    int hidden_dim = 0;
+    int token_cap = 0;
+
+    int n_layers = ds4_session_copy_deepspec_sequence_summary(
+        s->session,
+        layer_ids,
+        16,
+        &seq_len,
+        &hidden_dim,
+        &token_cap,
+        tokens_per_layer,
+        stats,
+        last_values,
+        limit);
+
+    if (n_layers <= 0) {
+        free(last_values);
+        http_error(j->fd, s->enable_cors, 500,
+                   "DeepSpec sequence capture unavailable; set DS4_DEEPSPEC_CAPTURE_SEQUENCE=1 and DS4_DEEPSPEC_CAPTURE_LAYERS before starting server");
+        return;
+    }
+
+    char *body = xmalloc(65536);
+    size_t off = 0;
+    int n = snprintf(body + off, 65536 - off,
+                     "{\"object\":\"ds4.debug_hidden_sequence\","
+                     "\"tensor\":\"ffn_norm\","
+                     "\"dtype\":\"float32\","
+                     "\"seq_len\":%d,"
+                     "\"token_cap\":%d,"
+                     "\"hidden_dim\":%d,"
+                     "\"layers\":[",
+                     seq_len,
+                     token_cap,
+                     hidden_dim);
+    if (n < 0 || (size_t)n >= 65536 - off) {
+        free(last_values);
+        free(body);
+        http_error(j->fd, s->enable_cors, 500, "hidden sequence response too large");
+        return;
+    }
+    off += (size_t)n;
+
+    for (int li = 0; li < n_layers; li++) {
+        n = snprintf(body + off, 65536 - off,
+                     "%s{\"layer_id\":%d,"
+                     "\"tokens_captured\":%d,"
+                     "\"last_values_count\":%d,"
+                     "\"last_values\":[",
+                     li ? "," : "",
+                     layer_ids[li],
+                     tokens_per_layer[li],
+                     limit);
+        if (n < 0 || (size_t)n >= 65536 - off) {
+            free(last_values);
+            free(body);
+            http_error(j->fd, s->enable_cors, 500, "hidden sequence response too large");
+            return;
+        }
+        off += (size_t)n;
+
+        for (int i = 0; i < limit; i++) {
+            n = snprintf(body + off, 65536 - off,
+                         "%s%.9g",
+                         i ? "," : "",
+                         (double)last_values[(uint64_t)li * limit + i]);
+            if (n < 0 || (size_t)n >= 65536 - off) {
+                free(last_values);
+                free(body);
+                http_error(j->fd, s->enable_cors, 500, "hidden sequence response too large");
+                return;
+            }
+            off += (size_t)n;
+        }
+
+        n = snprintf(body + off, 65536 - off,
+                     "],\"stats\":{\"mean\":%.9g,\"rms\":%.9g,\"min\":%.9g,\"max\":%.9g}}",
+                     stats[(uint64_t)li * 4 + 0],
+                     stats[(uint64_t)li * 4 + 1],
+                     stats[(uint64_t)li * 4 + 2],
+                     stats[(uint64_t)li * 4 + 3]);
+        if (n < 0 || (size_t)n >= 65536 - off) {
+            free(last_values);
+            free(body);
+            http_error(j->fd, s->enable_cors, 500, "hidden sequence response too large");
+            return;
+        }
+        off += (size_t)n;
+    }
+
+    n = snprintf(body + off, 65536 - off, "],\"ok\":true}");
+    if (n < 0 || (size_t)n >= 65536 - off) {
+        free(last_values);
+        free(body);
+        http_error(j->fd, s->enable_cors, 500, "hidden sequence response too large");
+        return;
+    }
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+    free(last_values);
+    free(body);
+}
+
+
+static void generate_debug_last_hidden_sequence_job(server *s, job *j) {
+    int limit = j->req.spec_top_k > 0 ? j->req.spec_top_k : 8;
+    if (limit > 64) limit = 64;
+
+    double stats[4];
+    float *last_values = xmalloc((size_t)limit * sizeof(last_values[0]));
+    int seq_len = 0;
+    int hidden_dim = 0;
+    int token_cap = 0;
+    int tokens_captured = 0;
+
+    int ok_summary = ds4_session_copy_deepspec_last_sequence_summary(
+        s->session,
+        &seq_len,
+        &hidden_dim,
+        &token_cap,
+        &tokens_captured,
+        stats,
+        last_values,
+        limit);
+
+    if (ok_summary <= 0) {
+        free(last_values);
+        http_error(j->fd, s->enable_cors, 500,
+                   "DeepSpec last-hidden sequence capture unavailable; set DS4_DEEPSPEC_CAPTURE_SEQUENCE=1 before starting server");
+        return;
+    }
+
+    char *body = xmalloc(16384);
+    size_t off = 0;
+    int n = snprintf(body + off, 16384 - off,
+                     "{\"object\":\"ds4.debug_last_hidden_sequence\","
+                     "\"tensor\":\"output_norm\","
+                     "\"dtype\":\"float32\","
+                     "\"seq_len\":%d,"
+                     "\"token_cap\":%d,"
+                     "\"hidden_dim\":%d,"
+                     "\"tokens_captured\":%d,"
+                     "\"last_values_count\":%d,"
+                     "\"last_values\":[",
+                     seq_len,
+                     token_cap,
+                     hidden_dim,
+                     tokens_captured,
+                     limit);
+    if (n < 0 || (size_t)n >= 16384 - off) {
+        free(last_values);
+        free(body);
+        http_error(j->fd, s->enable_cors, 500, "last hidden sequence response too large");
+        return;
+    }
+    off += (size_t)n;
+
+    for (int i = 0; i < limit; i++) {
+        n = snprintf(body + off, 16384 - off,
+                     "%s%.9g",
+                     i ? "," : "",
+                     (double)last_values[i]);
+        if (n < 0 || (size_t)n >= 16384 - off) {
+            free(last_values);
+            free(body);
+            http_error(j->fd, s->enable_cors, 500, "last hidden sequence response too large");
+            return;
+        }
+        off += (size_t)n;
+    }
+
+    n = snprintf(body + off, 16384 - off,
+                 "],\"stats\":{\"mean\":%.9g,\"rms\":%.9g,\"min\":%.9g,\"max\":%.9g},\"ok\":true}",
+                 stats[0],
+                 stats[1],
+                 stats[2],
+                 stats[3]);
+    if (n < 0 || (size_t)n >= 16384 - off) {
+        free(last_values);
+        free(body);
+        http_error(j->fd, s->enable_cors, 500, "last hidden sequence response too large");
+        return;
+    }
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+    free(last_values);
+    free(body);
+}
+
+
+static void generate_deepspec_dump_sequence_job(server *s, job *j) {
+    (void)j;
+
+    const char *base = getenv("DS4_DEEPSPEC_DUMP_PREFIX");
+    if (!base || !base[0]) base = "/tmp/ds4_deepspec_sample";
+
+    static uint64_t counter = 0;
+    counter++;
+
+    char prefix[4096];
+    int n = snprintf(prefix, sizeof(prefix), "%s.%llu",
+                     base,
+                     (unsigned long long)counter);
+    if (n <= 0 || (size_t)n >= sizeof(prefix)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec dump prefix too long");
+        return;
+    }
+
+    char err[1024];
+    if (ds4_session_dump_deepspec_sequence_raw(s->session,
+                                               prefix,
+                                               err,
+                                               sizeof(err)) != 0) {
+        http_error(j->fd, s->enable_cors, 500, err[0] ? err : "DeepSpec sequence dump failed");
+        return;
+    }
+
+    char body[16384];
+    n = snprintf(body, sizeof(body),
+                 "{\"object\":\"ds4.deepspec_dump_sequence\","
+                 "\"prefix\":\"%s\","
+                 "\"meta\":\"%s.meta.json\","
+                 "\"input_ids\":\"%s.input_ids.i32\","
+                 "\"target_hidden_states\":\"%s.target_hidden.f32\","
+                 "\"target_last_hidden_states\":\"%s.target_last_hidden.f32\","
+                 "\"ok\":true}",
+                 prefix,
+                 prefix,
+                 prefix,
+                 prefix,
+                 prefix);
+    if (n <= 0 || (size_t)n >= sizeof(body)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec dump response too large");
+        return;
+    }
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+}
+
+
+
+static bool ds4_deepspec_parse_http_url(const char *url,
+                                        char *host, size_t hostlen,
+                                        int *port_out,
+                                        char *path, size_t pathlen) {
+    if (!url || !url[0]) return false;
+
+    const char *p = url;
+    const char *scheme = "http://";
+    const size_t scheme_len = strlen(scheme);
+    if (!strncmp(p, scheme, scheme_len)) p += scheme_len;
+
+    const char *host_start = p;
+    while (*p && *p != ':' && *p != '/') p++;
+    if (p == host_start) return false;
+
+    const size_t hlen = (size_t)(p - host_start);
+    if (hlen + 1 > hostlen) return false;
+    memcpy(host, host_start, hlen);
+    host[hlen] = '\0';
+
+    int port = 80;
+    if (*p == ':') {
+        p++;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p || v <= 0 || v > 65535) return false;
+        port = (int)v;
+        p = end;
+    }
+
+    if (*p == '/') {
+        if (strlen(p) + 1 > pathlen) return false;
+        snprintf(path, pathlen, "%s", p);
+    } else {
+        if (pathlen < 2) return false;
+        snprintf(path, pathlen, "/");
+    }
+
+    *port_out = port;
+    return true;
+}
+
+
+static char *ds4_deepspec_http_post_json(const char *url,
+                                         const char *json,
+                                         int *status_out,
+                                         char *err,
+                                         size_t errlen) {
+    char host[256];
+    char path[1024];
+    int port = 0;
+    if (!ds4_deepspec_parse_http_url(url, host, sizeof(host), &port, path, sizeof(path))) {
+        snprintf(err, errlen, "invalid sidecar_url");
+        return NULL;
+    }
+
+    const char *connect_host = host;
+    if (!strcmp(connect_host, "localhost")) connect_host = "127.0.0.1";
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        snprintf(err, errlen, "sidecar socket failed");
+        return NULL;
+    }
+
+    int timeout_sec = 120;
+    const char *timeout_env = getenv("DS4_DEEPSPEC_SIDECAR_TIMEOUT_SEC");
+    if (timeout_env && timeout_env[0]) {
+        int parsed = atoi(timeout_env);
+        if (parsed >= 1 && parsed <= 3600) timeout_sec = parsed;
+    }
+    struct timeval socket_timeout = {.tv_sec = timeout_sec, .tv_usec = 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &socket_timeout, sizeof(socket_timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &socket_timeout, sizeof(socket_timeout));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, connect_host, &sa.sin_addr) != 1) {
+        close(fd);
+        snprintf(err, errlen, "sidecar host must be IPv4/localhost for debug endpoint");
+        return NULL;
+    }
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        snprintf(err, errlen, "sidecar connect failed");
+        return NULL;
+    }
+
+    const size_t json_len = json ? strlen(json) : 0;
+    buf req = {0};
+    buf_printf(&req,
+               "POST %s HTTP/1.1\r\n"
+               "Host: %s:%d\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %zu\r\n"
+               "Connection: close\r\n"
+               "\r\n",
+               path,
+               host,
+               port,
+               json_len);
+    if (json_len) buf_append(&req, json, json_len);
+
+    bool ok = send_all(fd, req.ptr, req.len);
+    buf_free(&req);
+    if (!ok) {
+        close(fd);
+        snprintf(err, errlen, "sidecar send failed");
+        return NULL;
+    }
+
+    buf resp = {0};
+    char tmp[8192];
+    ssize_t nread = 0;
+    while ((nread = read(fd, tmp, sizeof(tmp))) > 0) {
+        buf_append(&resp, tmp, (size_t)nread);
+    }
+    close(fd);
+
+    if (nread < 0) {
+        buf_free(&resp);
+        snprintf(err, errlen, "sidecar response timed out or failed");
+        return NULL;
+    }
+
+    if (!resp.ptr || resp.len == 0) {
+        buf_free(&resp);
+        snprintf(err, errlen, "empty sidecar response");
+        return NULL;
+    }
+
+    int status = 0;
+    if (sscanf(resp.ptr, "HTTP/%*s %d", &status) != 1) status = 0;
+    if (status_out) *status_out = status;
+
+    char *body = strstr(resp.ptr, "\r\n\r\n");
+    if (!body) {
+        buf_free(&resp);
+        snprintf(err, errlen, "malformed sidecar HTTP response");
+        return NULL;
+    }
+    body += 4;
+
+    char *out = xstrdup(body);
+    buf_free(&resp);
+    return out;
+}
+
+
+static bool ds4_deepspec_json_parse_int_field(const char *json,
+                                              const char *field,
+                                              int *out) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", field);
+    const char *key = strstr(json ? json : "", needle);
+    if (!key) return false;
+
+    const char *p = strchr(key, ':');
+    if (!p) return false;
+    p++;
+
+    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || v < 0 || v > INT_MAX) return false;
+
+    *out = (int)v;
+    return true;
+}
+
+
+static void ds4_deepspec_append_int_array(buf *b, const int *v, int n) {
+    buf_putc(b, '[');
+    for (int i = 0; i < n; i++) {
+        if (i) buf_putc(b, ',');
+        buf_printf(b, "%d", v[i]);
+    }
+    buf_putc(b, ']');
+}
+
+
+static void generate_deepspec_draft_verify_once_job(server *s, job *j) {
+    const char *base = getenv("DS4_DEEPSPEC_DUMP_PREFIX");
+    if (!base || !base[0]) base = "/tmp/ds4_deepspec_sample";
+
+    static uint64_t counter = 0;
+    counter++;
+
+    char prefix[4096];
+    int n = snprintf(prefix, sizeof(prefix), "%s.draft.%llu",
+                     base,
+                     (unsigned long long)counter);
+    if (n <= 0 || (size_t)n >= sizeof(prefix)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec draft dump prefix too long");
+        return;
+    }
+
+    char err[1024];
+    err[0] = '\0';
+    if (ds4_session_dump_deepspec_sequence_raw(s->session,
+                                               prefix,
+                                               err,
+                                               sizeof(err)) != 0) {
+        http_error(j->fd, s->enable_cors, 500,
+                   err[0] ? err : "DeepSpec draft dump failed");
+        return;
+    }
+
+    char meta_path[4096];
+    char input_path[4096];
+    char hidden_path[4096];
+    char last_path[4096];
+    n = snprintf(meta_path, sizeof(meta_path), "%s.meta.json", prefix);
+    if (n <= 0 || (size_t)n >= sizeof(meta_path)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec draft meta path too long");
+        return;
+    }
+    n = snprintf(input_path, sizeof(input_path), "%s.input_ids.i32", prefix);
+    if (n <= 0 || (size_t)n >= sizeof(input_path)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec draft input path too long");
+        return;
+    }
+    n = snprintf(hidden_path, sizeof(hidden_path), "%s.target_hidden.f32", prefix);
+    if (n <= 0 || (size_t)n >= sizeof(hidden_path)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec draft hidden path too long");
+        return;
+    }
+    n = snprintf(last_path, sizeof(last_path), "%s.target_last_hidden.f32", prefix);
+    if (n <= 0 || (size_t)n >= sizeof(last_path)) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec draft last-hidden path too long");
+        return;
+    }
+
+    char *sidecar_url = ds4_json_parse_optional_string_field(j->req.raw_body, "sidecar_url");
+    if (!sidecar_url) {
+        const char *env_url = getenv("DS4_DEEPSPEC_SIDECAR_URL");
+        sidecar_url = xstrdup(env_url && env_url[0]
+            ? env_url
+            : "http://127.0.0.1:8091/v1/ds4/draft_argmax_from_raw");
+    }
+
+    int top_k = j->req.spec_top_k > 0 ? j->req.spec_top_k : 8;
+    if (top_k > 64) top_k = 64;
+
+    buf payload = {0};
+    buf_puts(&payload, "{\"meta\":");
+    json_escape(&payload, meta_path);
+    buf_puts(&payload, ",\"input_ids\":");
+    json_escape(&payload, input_path);
+    buf_puts(&payload, ",\"target_hidden_states\":");
+    json_escape(&payload, hidden_path);
+    buf_puts(&payload, ",\"target_last_hidden_states\":");
+    json_escape(&payload, last_path);
+    buf_printf(&payload, ",\"top_k\":%d}", top_k);
+
+    int sidecar_status = 0;
+    err[0] = '\0';
+    char *sidecar_body = ds4_deepspec_http_post_json(sidecar_url,
+                                                     payload.ptr ? payload.ptr : "{}",
+                                                     &sidecar_status,
+                                                     err,
+                                                     sizeof(err));
+    buf_free(&payload);
+
+    if (!sidecar_body) {
+        free(sidecar_url);
+        http_error(j->fd, s->enable_cors, 500,
+                   err[0] ? err : "DeepSpec sidecar request failed");
+        return;
+    }
+
+    if (sidecar_status != 200) {
+        buf body = {0};
+        buf_puts(&body, "{\"object\":\"ds4.deepspec_draft_verify_once\","
+                        "\"ok\":false,\"error\":\"sidecar returned non-200\","
+                        "\"sidecar_http_status\":");
+        buf_printf(&body, "%d", sidecar_status);
+        buf_puts(&body, ",\"sidecar_response\":");
+        if (sidecar_body[0] == '{') buf_puts(&body, sidecar_body);
+        else json_escape(&body, sidecar_body);
+        buf_putc(&body, '}');
+        http_response(j->fd, s->enable_cors, 502, "application/json", body.ptr);
+        buf_free(&body);
+        free(sidecar_body);
+        free(sidecar_url);
+        return;
+    }
+
+    int draft = -1;
+    if (!ds4_deepspec_json_parse_int_field(sidecar_body, "draft_argmax", &draft)) {
+        free(sidecar_body);
+        free(sidecar_url);
+        http_error(j->fd, s->enable_cors, 500, "sidecar response missing draft_argmax");
+        return;
+    }
+
+    int committed[17];
+    int accepted = 0;
+    err[0] = '\0';
+    int committed_n = ds4_session_verify_draft_argmax(
+        s->session,
+        &draft,
+        1,
+        ds4_token_eos(s->engine),
+        committed,
+        (int)(sizeof(committed) / sizeof(committed[0])),
+        &accepted,
+        err,
+        sizeof(err));
+
+    if (committed_n < 0) {
+        free(sidecar_body);
+        free(sidecar_url);
+        http_error(j->fd, s->enable_cors, 500,
+                   err[0] ? err : "DeepSpec draft verifier failed");
+        return;
+    }
+
+    buf body = {0};
+    buf_puts(&body, "{\"object\":\"ds4.deepspec_draft_verify_once\",");
+    buf_puts(&body, "\"source\":\"ds4_hidden_sequence_to_sidecar_to_verifier\",");
+    buf_puts(&body, "\"sidecar_url\":");
+    json_escape(&body, sidecar_url);
+    buf_puts(&body, ",\"dump\":{\"prefix\":");
+    json_escape(&body, prefix);
+    buf_puts(&body, ",\"meta\":");
+    json_escape(&body, meta_path);
+    buf_puts(&body, ",\"input_ids\":");
+    json_escape(&body, input_path);
+    buf_puts(&body, ",\"target_hidden_states\":");
+    json_escape(&body, hidden_path);
+    buf_puts(&body, ",\"target_last_hidden_states\":");
+    json_escape(&body, last_path);
+    buf_puts(&body, "},\"sidecar_http_status\":");
+    buf_printf(&body, "%d", sidecar_status);
+    buf_puts(&body, ",\"draft_token_ids\":");
+    buf_printf(&body, "%d", draft);
+    buf_puts(&body, ",\"accepted_draft_tokens\":");
+    buf_printf(&body, "%d", accepted);
+    buf_puts(&body, ",\"committed_tokens\":");
+    buf_printf(&body, "%d", committed_n);
+    buf_puts(&body, ",\"committed_token_ids\":");
+    ds4_deepspec_append_int_array(&body, committed, committed_n);
+    buf_puts(&body, ",\"position\":");
+    buf_printf(&body, "%d", ds4_session_pos(s->session));
+    buf_puts(&body, ",\"sidecar_response\":");
+    if (sidecar_body[0] == '{') buf_puts(&body, sidecar_body);
+    else json_escape(&body, sidecar_body);
+    buf_puts(&body, ",\"ok\":true}");
+
+    http_response(j->fd, s->enable_cors, 200, "application/json", body.ptr);
+
+    buf_free(&body);
+    free(sidecar_body);
+    free(sidecar_url);
+}
+
+
+
+#include "ds4_deepspec_generate_dflash_loop_ds12c1.inc"
+
+static void generate_deepspec_reset_sample_job(server *s, job *j) {
+    g_deepspec_disable_kv_load_for_capture = true;
+    if (ds4_session_deepspec_reset_sample(s->session) != 0) {
+        http_error(j->fd, s->enable_cors, 500, "DeepSpec sample reset failed");
+        return;
+    }
+
+    const char *body = "{\"object\":\"ds4.deepspec_reset_sample\",\"position\":0,\"ok\":true}";
+    http_response(j->fd, s->enable_cors, 200, "application/json", body);
+}
+
 static void generate_job(server *s, job *j) {
+    if (j->req.kind == REQ_SPEC_VERIFY_ARGMAX) {
+        generate_spec_verify_argmax_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_SPEC_VERIFY_DFLASH) {
+        generate_spec_verify_dflash_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_SPEC_TARGET_LOGPROBS) {
+        generate_spec_target_logprobs_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEBUG_HIDDEN_LAST) {
+        generate_debug_hidden_last_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEBUG_HIDDEN_LAYERS) {
+        generate_debug_hidden_layers_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEBUG_HIDDEN_SEQUENCE) {
+        generate_debug_hidden_sequence_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEBUG_LAST_HIDDEN_SEQUENCE) {
+        generate_debug_last_hidden_sequence_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEEPSPEC_RESET_SAMPLE) {
+        generate_deepspec_reset_sample_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEEPSPEC_DUMP_SEQUENCE) {
+        generate_deepspec_dump_sequence_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEEPSPEC_DRAFT_VERIFY_ONCE) {
+        generate_deepspec_draft_verify_once_job(s, j);
+        return;
+    }
+    if (j->req.kind == REQ_DS4_DEEPSPEC_GENERATE_DFLASH) {
+        generate_deepspec_generate_dflash_job(s, j);
+        return;
+    }
+
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(s->session);
@@ -10355,8 +12645,10 @@ static void generate_job(server *s, job *j) {
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    ds4_tokens committed_token_ids = {0};
 decode_again:
     ;
+    ds4_tokens_free(&committed_token_ids);
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
@@ -10374,6 +12666,8 @@ decode_again:
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    double first_commit_t = -1.0;
+    double last_commit_t = -1.0;
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -10452,6 +12746,9 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            ds4_tokens_push(&committed_token_ids, token);
+            last_commit_t = now_sec();
+            if (first_commit_t < 0.0) first_commit_t = last_commit_t;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -10965,7 +13262,9 @@ decode_again:
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+                       prompt_tokens, completion,
+                       &committed_token_ids, ds4_token_eos(s->engine),
+                       t0, first_commit_t, last_commit_t, now_sec());
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -11033,6 +13332,7 @@ decode_again:
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
     buf_free(&text);
+    ds4_tokens_free(&committed_token_ids);
     ds4_tokens_free(&effective_prompt);
 }
 
@@ -11282,7 +13582,51 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = ds4_session_ctx(s->session);
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/deepspec_reset_sample")) {
+        ok = parse_deepspec_reset_sample_request(s->engine, hr.body,
+                                                 s->default_tokens, ctx_size,
+                                                 &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/deepspec_dump_sequence")) {
+        ok = parse_deepspec_dump_sequence_request(s->engine, hr.body,
+                                                  s->default_tokens, ctx_size,
+                                                  &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/deepspec_draft_verify_once")) {
+        ok = parse_deepspec_draft_verify_once_request(s->engine, hr.body,
+                                                      s->default_tokens, ctx_size,
+                                                      &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/deepspec_generate_dflash")) {
+        ok = parse_deepspec_generate_dflash_request(s->engine, hr.body,
+                                                    s->default_tokens, ctx_size,
+                                                    &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/debug_last_hidden_sequence")) {
+        ok = parse_debug_last_hidden_sequence_request(s->engine, hr.body,
+                                                      s->default_tokens, ctx_size,
+                                                      &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/debug_hidden_sequence")) {
+        ok = parse_debug_hidden_sequence_request(s->engine, hr.body,
+                                                 s->default_tokens, ctx_size,
+                                                 &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/debug_hidden_layers")) {
+        ok = parse_debug_hidden_layers_request(s->engine, hr.body,
+                                               s->default_tokens, ctx_size,
+                                               &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/debug_hidden_last")) {
+        ok = parse_debug_hidden_last_request(s->engine, hr.body,
+                                             s->default_tokens, ctx_size,
+                                             &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/spec_target_logprobs")) {
+        ok = parse_spec_target_logprobs_request(s->engine, hr.body,
+                                                s->default_tokens, ctx_size,
+                                                &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/spec_verify_argmax")) {
+        ok = parse_spec_verify_argmax_request(s->engine, hr.body,
+                                              s->default_tokens, ctx_size,
+                                              &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/ds4/spec_verify_dflash")) {
+        ok = parse_spec_verify_dflash_request(s->engine, hr.body,
+                                             s->default_tokens, ctx_size,
+                                             &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
@@ -15757,7 +18101,49 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_runtime_token_provenance_opt_in_and_schema(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 4);
+    TEST_ASSERT(!r.ds4_return_runtime_metrics);
+    TEST_ASSERT(!r.ds4_return_token_ids);
+    ds4_tokens committed = {0};
+    ds4_tokens_push(&committed, 101);
+    ds4_tokens_push(&committed, 202);
+    buf absent = {0};
+    append_target_runtime_json(&absent, &r, &committed, 7, 2, "length", 999,
+                               1.0, 1.1, 1.2, 1.3);
+    TEST_ASSERT(absent.len == 0);
+    r.ds4_return_runtime_metrics = true;
+    r.ds4_return_token_ids = true;
+    buf present = {0};
+    append_target_runtime_json(&present, &r, &committed, 7, 2, "length", 999,
+                               1.0, 1.1, 1.2, 1.3);
+    TEST_ASSERT(strstr(present.ptr, "\"schema\":\"ds4_runtime_generation_v1\"") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"mode\":\"target_only\"") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"token_id_provenance\":\"native_commit_path\"") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"completion_token_ids\":[101,202]") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"completion_token_count\":2") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"prompt_token_count\":7") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"finish_reason\":\"length\"") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"eos_token_id\":999") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"ttft_ms\":100.000") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"decode_ms\":100.000") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"generation_tokens_per_second\":10.000000") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"proposed_draft_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"accepted_draft_tokens\":0") != NULL);
+    TEST_ASSERT(strstr(present.ptr, "\"fallback_reason\":null") != NULL);
+    TEST_ASSERT(ds4_json_parse_optional_bool_field(
+        "{\"ds4_return_token_ids\": true}", "ds4_return_token_ids", false));
+    TEST_ASSERT(!ds4_json_parse_optional_bool_field(
+        "{}", "ds4_return_token_ids", false));
+    buf_free(&absent);
+    buf_free(&present);
+    ds4_tokens_free(&committed);
+    request_free(&r);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_runtime_token_provenance_opt_in_and_schema();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();

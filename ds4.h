@@ -260,12 +260,47 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
+int ds4_session_hidden_dim(void);
+int ds4_session_copy_last_hidden_norm(ds4_session *s, float *out, int cap);
+int ds4_session_copy_deepspec_layer_hidden_norms(ds4_session *s,
+                                                  int *layer_ids, int max_layers,
+                                                  float *out, int cap,
+                                                  int *hidden_dim,
+                                                  int *position);
+int ds4_session_copy_deepspec_sequence_summary(ds4_session *s,
+                                                int *layer_ids, int max_layers,
+                                                int *seq_len,
+                                                int *hidden_dim,
+                                                int *token_cap,
+                                                int *tokens_per_layer,
+                                                double *stats,
+                                                float *last_values,
+                                                int last_values_limit);
+int ds4_session_copy_deepspec_last_sequence_summary(ds4_session *s,
+                                                     int *seq_len,
+                                                     int *hidden_dim,
+                                                     int *token_cap,
+                                                     int *tokens_captured,
+                                                     double *stats,
+                                                     float *last_values,
+                                                     int last_values_limit);
+int ds4_session_dump_deepspec_sequence_raw(ds4_session *s,
+                                           const char *prefix,
+                                           char *err,
+                                           size_t errlen);
+int ds4_session_deepspec_reset_sample(ds4_session *s);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_verify_draft_argmax(ds4_session *s,
+                                     const int *draft_tokens, int n_draft,
+                                     int eos_token,
+                                     int *committed, int committed_cap,
+                                     int *accepted_draft_tokens,
+                                     char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

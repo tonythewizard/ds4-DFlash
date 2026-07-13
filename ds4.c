@@ -37,6 +37,14 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_markov_table_top8.h"
+#include "ds4_rl_policy_stage1.h"
+#include "ds4_rl_policy_context_stage3.h"
+#include "ds4_rl_policy_context_stage4.h"
+#include "ds4_rl_expert_stage5.h"
+#ifndef DS4_MARKOV_TOPK
+#define DS4_MARKOV_TOPK 8
+#endif
 #include "ds4_distributed.h"
 
 #ifndef DS4_NO_GPU
@@ -770,6 +778,8 @@ typedef struct {
     bool active;
     char *path;
     char *hotlist_path;
+    char *trace_path;
+    FILE *trace_fp;
     char model_name[64];
     uint32_t n_layer;
     uint32_t n_expert;
@@ -796,6 +806,13 @@ typedef struct {
 } ds4_expert_profile;
 
 static ds4_expert_profile g_expert_profile;
+
+static int32_t ds4_markov_prev_selected[DS4_MAX_LAYER][DS4_MAX_EXPERT_USED];
+static bool ds4_markov_prev_valid[DS4_MAX_LAYER];
+static uint64_t ds4_markov_pred_total = 0;
+static uint64_t ds4_markov_actual_total = 0;
+static uint64_t ds4_markov_match_total = 0;
+
 
 static int ds4_expert_profile_sort_cmp(const void *a, const void *b) {
     const ds4_expert_profile_sort_entry *ea = a;
@@ -860,6 +877,16 @@ static void ds4_expert_profile_init(const char *path, const char *hotlist_path) 
 
     g_expert_profile.active = true;
     if (path && path[0]) g_expert_profile.path = ds4_strdup(path);
+    const char *trace_path = getenv("DS4_EXPERT_TRACE");
+    if (trace_path && trace_path[0]) {
+        g_expert_profile.trace_path = ds4_strdup(trace_path);
+        g_expert_profile.trace_fp = fopen(trace_path, "w");
+        if (g_expert_profile.trace_fp) {
+            fputs("pos,layer,is_hash,e0,e1,e2,e3,e4,e5,w0,w1,w2,w3,w4,w5\n", g_expert_profile.trace_fp);
+        } else {
+            fprintf(stderr, "ds4: failed to open expert trace output %s: %s\n", trace_path, strerror(errno));
+        }
+    }
     if (hotlist_path && hotlist_path[0]) {
         g_expert_profile.hotlist_path = ds4_strdup(hotlist_path);
     }
@@ -931,7 +958,7 @@ static void ds4_expert_profile_record(
     p->total_records++;
     if (is_hash) p->layer_is_hash[il] = true;
 
-    if (p->prev_valid[il] && p->prev_pos[il] + 1u == pos) {
+    if (p->prev_valid[il]) {
         uint32_t intersection = 0;
         for (uint32_t a = 0; a < p->n_expert_used; a++) {
             for (uint32_t b = 0; b < p->n_expert_used; b++) {
@@ -949,6 +976,17 @@ static void ds4_expert_profile_record(
             p->adjacent_jaccard_sum[il] +=
                 (double)intersection / (double)union_size;
         }
+    }
+
+    if (p->trace_fp) {
+        fprintf(p->trace_fp, "%u,%u,%u", pos, il, is_hash ? 1u : 0u);
+        for (uint32_t slot = 0; slot < p->n_expert_used; slot++) {
+            fprintf(p->trace_fp, ",%d", selected[slot]);
+        }
+        for (uint32_t slot = 0; slot < p->n_expert_used; slot++) {
+            fprintf(p->trace_fp, ",%.9g", (double)weights[slot]);
+        }
+        fputc(10, p->trace_fp);
     }
 
     p->prev_valid[il] = true;
@@ -1034,7 +1072,8 @@ static void ds4_expert_profile_write_layer(FILE *fp, uint32_t il) {
             avg_jaccard);
 
     fputs("      \"top_experts\": [", fp);
-    const uint32_t top_n = unique < 16u ? unique : 16u;
+    const uint32_t cap = getenv("DS4_EXPERT_PROFILE_FULL") ? p->n_expert : 16u;
+    const uint32_t top_n = unique < cap ? unique : cap;
     for (uint32_t i = 0; i < top_n; i++) {
         const double pct = selections ?
             100.0 * (double)entries[i].count / (double)selections : 0.0;
@@ -1139,6 +1178,10 @@ static void ds4_expert_profile_write_hotlist_file(ds4_expert_profile *p) {
 static void ds4_expert_profile_close(void) {
     ds4_expert_profile *p = &g_expert_profile;
     if (!p->active) return;
+    if (p->trace_fp) {
+        fclose(p->trace_fp);
+        p->trace_fp = NULL;
+    }
 
     if (p->path) {
         FILE *fp = fopen(p->path, "wb");
@@ -7466,6 +7509,8 @@ static void layer_routed_moe_one(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
+    ds4_expert_profile_record(il, (uint32_t)token, selected, expert_weight,
+                              layer->ffn_gate_tid2eid != NULL);
 
     if (!trace) {
         matvec_experts_mid_prequant(mid_all, model,
@@ -7560,6 +7605,9 @@ static void layer_routed_moe_one_prealloc(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
+
+    ds4_expert_profile_record(il, (uint32_t)token, selected, expert_weight,
+                              layer->ffn_gate_tid2eid != NULL);
 
     matvec_experts_mid_prequant(mid_all, model,
                                 layer->ffn_gate_exps,
@@ -10386,6 +10434,18 @@ typedef struct {
     ds4_gpu_tensor *after_attn_hc;
     ds4_gpu_tensor *ffn_cur;
     ds4_gpu_tensor *ffn_norm;
+    uint32_t deepspec_capture_layer_ids[16];
+    uint32_t deepspec_capture_n;
+    uint32_t deepspec_capture_valid_mask;
+    uint32_t deepspec_capture_pos;
+    float *deepspec_capture_hidden;
+    uint32_t deepspec_sequence_token_cap;
+    uint32_t deepspec_sequence_pos_max;
+    float *deepspec_sequence_layer_hidden;
+    uint8_t *deepspec_sequence_layer_valid;
+    uint32_t deepspec_last_sequence_pos_max;
+    float *deepspec_sequence_last_hidden;
+    uint8_t *deepspec_sequence_last_valid;
     ds4_gpu_tensor *shared_gate;
     ds4_gpu_tensor *shared_up;
     ds4_gpu_tensor *shared_mid;
@@ -10533,6 +10593,11 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    if (g) { free(g->deepspec_capture_hidden); g->deepspec_capture_hidden = NULL; }
+    if (g) { free(g->deepspec_sequence_layer_hidden); g->deepspec_sequence_layer_hidden = NULL; }
+    if (g) { free(g->deepspec_sequence_layer_valid); g->deepspec_sequence_layer_valid = NULL; }
+    if (g) { free(g->deepspec_sequence_last_hidden); g->deepspec_sequence_last_hidden = NULL; }
+    if (g) { free(g->deepspec_sequence_last_valid); g->deepspec_sequence_last_valid = NULL; }
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -10954,6 +11019,194 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
+
+static bool metal_graph_deepspec_capture_parse_layers(ds4_gpu_graph *g) {
+    const char *env = getenv("DS4_DEEPSPEC_CAPTURE_LAYERS");
+    if (!g || !env || !env[0]) return true;
+
+    uint32_t n = 0;
+    const char *p = env;
+    while (*p && n < 16) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        if (!*p) break;
+
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            while (*p && *p != ',') p++;
+            continue;
+        }
+        if (v >= 0 && v < (long)DS4_N_LAYER) {
+            bool dup = false;
+            for (uint32_t i = 0; i < n; i++) {
+                if (g->deepspec_capture_layer_ids[i] == (uint32_t)v) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) g->deepspec_capture_layer_ids[n++] = (uint32_t)v;
+        }
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ',') p++;
+    }
+
+    g->deepspec_capture_n = n;
+    g->deepspec_capture_valid_mask = 0;
+    g->deepspec_capture_pos = UINT32_MAX;
+
+    if (n == 0) return true;
+
+    const uint64_t floats = (uint64_t)n * DS4_N_EMBD;
+    g->deepspec_capture_hidden = xmalloc((size_t)floats * sizeof(g->deepspec_capture_hidden[0]));
+    memset(g->deepspec_capture_hidden, 0, (size_t)floats * sizeof(g->deepspec_capture_hidden[0]));
+
+    fprintf(stderr, "ds4: DeepSpec layer hidden capture enabled for %u layer(s):", n);
+    for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %u", g->deepspec_capture_layer_ids[i]);
+    fprintf(stderr, "\n");
+    return g->deepspec_capture_hidden != NULL;
+}
+
+static int metal_graph_deepspec_capture_slot(const ds4_gpu_graph *g, uint32_t il) {
+    if (!g || !g->deepspec_capture_hidden || g->deepspec_capture_n == 0) return -1;
+    for (uint32_t i = 0; i < g->deepspec_capture_n; i++) {
+        if (g->deepspec_capture_layer_ids[i] == il) return (int)i;
+    }
+    return -1;
+}
+
+static bool metal_graph_deepspec_capture_ffn_norm(
+        ds4_gpu_graph  *g,
+        ds4_gpu_tensor *x,
+        uint32_t        il,
+        uint32_t        pos) {
+    const int slot = metal_graph_deepspec_capture_slot(g, il);
+    if (slot < 0) return true;
+    if (!x) return false;
+
+    if (g->deepspec_capture_pos != pos) {
+        g->deepspec_capture_pos = pos;
+        g->deepspec_capture_valid_mask = 0;
+    }
+
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before DeepSpec hidden capture layer %u pos %u\n", il, pos);
+        return false;
+    }
+
+    float *dst = g->deepspec_capture_hidden + (uint64_t)slot * DS4_N_EMBD;
+    if (ds4_gpu_tensor_read(x, 0, dst, (uint64_t)DS4_N_EMBD * sizeof(dst[0])) == 0) {
+        fprintf(stderr, "ds4: failed to read DeepSpec hidden capture layer %u pos %u\n", il, pos);
+        return false;
+    }
+
+    g->deepspec_capture_valid_mask |= (1u << (uint32_t)slot);
+
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume command batch after DeepSpec hidden capture layer %u pos %u\n", il, pos);
+        return false;
+    }
+
+    return true;
+}
+
+
+static uint32_t metal_graph_deepspec_sequence_capture_tokens(uint32_t default_cap) {
+    const char *env = getenv("DS4_DEEPSPEC_SEQUENCE_CAPTURE_TOKENS");
+    if (!env || !env[0]) return default_cap ? default_cap : 512u;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || v == 0) return default_cap ? default_cap : 512u;
+    if (v > 8192ul) v = 8192ul;
+    return (uint32_t)v;
+}
+
+static bool metal_graph_deepspec_sequence_capture_init(ds4_gpu_graph *g, uint32_t default_cap) {
+    const char *env = getenv("DS4_DEEPSPEC_CAPTURE_SEQUENCE");
+    if (!g || !env || !env[0] || !strcmp(env, "0")) return true;
+
+    if (g->deepspec_capture_n == 0) {
+        fprintf(stderr, "ds4: DeepSpec sequence capture requested but no DS4_DEEPSPEC_CAPTURE_LAYERS are configured\n");
+        return true;
+    }
+
+    const uint32_t cap = metal_graph_deepspec_sequence_capture_tokens(default_cap);
+    if (cap == 0) return true;
+
+    const uint64_t floats = (uint64_t)g->deepspec_capture_n * cap * DS4_N_EMBD;
+    const uint64_t valid = (uint64_t)g->deepspec_capture_n * cap;
+
+    g->deepspec_sequence_layer_hidden = xmalloc((size_t)floats * sizeof(g->deepspec_sequence_layer_hidden[0]));
+    g->deepspec_sequence_layer_valid = xmalloc((size_t)valid * sizeof(g->deepspec_sequence_layer_valid[0]));
+    g->deepspec_sequence_last_hidden = xmalloc((size_t)cap * DS4_N_EMBD * sizeof(g->deepspec_sequence_last_hidden[0]));
+    g->deepspec_sequence_last_valid = xmalloc((size_t)cap * sizeof(g->deepspec_sequence_last_valid[0]));
+    memset(g->deepspec_sequence_layer_hidden, 0, (size_t)floats * sizeof(g->deepspec_sequence_layer_hidden[0]));
+    memset(g->deepspec_sequence_layer_valid, 0, (size_t)valid * sizeof(g->deepspec_sequence_layer_valid[0]));
+    memset(g->deepspec_sequence_last_hidden, 0, (size_t)cap * DS4_N_EMBD * sizeof(g->deepspec_sequence_last_hidden[0]));
+    memset(g->deepspec_sequence_last_valid, 0, (size_t)cap * sizeof(g->deepspec_sequence_last_valid[0]));
+    g->deepspec_sequence_token_cap = cap;
+    g->deepspec_sequence_pos_max = 0;
+    g->deepspec_last_sequence_pos_max = 0;
+
+    fprintf(stderr,
+            "ds4: DeepSpec sequence ffn_norm capture enabled for %u layer(s), token_cap=%u\n",
+            g->deepspec_capture_n,
+            cap);
+    return g->deepspec_sequence_layer_hidden != NULL &&
+           g->deepspec_sequence_layer_valid != NULL &&
+           g->deepspec_sequence_last_hidden != NULL &&
+           g->deepspec_sequence_last_valid != NULL;
+}
+
+static bool metal_graph_deepspec_capture_sequence_ffn_norm(
+        ds4_gpu_graph  *g,
+        ds4_gpu_tensor *x,
+        uint32_t        il,
+        uint32_t        pos0,
+        uint32_t        n_tokens) {
+    if (!g || !g->deepspec_sequence_layer_hidden || !g->deepspec_sequence_layer_valid) return true;
+    if (!x || n_tokens == 0) return false;
+
+    const int slot = metal_graph_deepspec_capture_slot(g, il);
+    if (slot < 0) return true;
+
+    const uint32_t cap = g->deepspec_sequence_token_cap;
+    if (pos0 >= cap) return true;
+
+    uint32_t rows = n_tokens;
+    if (pos0 + rows > cap) rows = cap - pos0;
+    if (rows == 0) return true;
+
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before DeepSpec sequence capture layer %u pos %u rows %u\n",
+                il, pos0, rows);
+        return false;
+    }
+
+    float *dst = g->deepspec_sequence_layer_hidden +
+                 ((uint64_t)slot * cap + pos0) * DS4_N_EMBD;
+    const uint64_t bytes = (uint64_t)rows * DS4_N_EMBD * sizeof(dst[0]);
+    if (ds4_gpu_tensor_read(x, 0, dst, bytes) == 0) {
+        fprintf(stderr, "ds4: failed to read DeepSpec sequence capture layer %u pos %u rows %u\n",
+                il, pos0, rows);
+        return false;
+    }
+
+    uint8_t *valid = g->deepspec_sequence_layer_valid + (uint64_t)slot * cap + pos0;
+    memset(valid, 1, rows);
+    if (pos0 + rows > g->deepspec_sequence_pos_max) {
+        g->deepspec_sequence_pos_max = pos0 + rows;
+    }
+
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume command batch after DeepSpec sequence capture layer %u pos %u rows %u\n",
+                il, pos0, rows);
+        return false;
+    }
+
+    return true;
+}
+
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -10964,6 +11217,8 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
+    if (!metal_graph_deepspec_capture_parse_layers(g)) return false;
+    if (!metal_graph_deepspec_sequence_capture_init(g, prefill_cap)) return false;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -14170,6 +14425,59 @@ static bool metal_graph_decode_selected_readahead_override(
     const bool profile =
         getenv("DS4_METAL_STREAMING_SELECTED_READAHEAD_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
+
+    if (getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL &&
+        il < DS4_N_LAYER &&
+        ds4_markov_prev_valid[il]) {
+        bool markov_seen[DS4_MAX_EXPERT] = {0};
+        uint32_t markov_unique = 0;
+        for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+            const int32_t prev = ds4_markov_prev_selected[il][mi];
+            if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+            for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                const uint32_t expert = ds4_markov_top8[il][(uint32_t)prev][mk];
+                if (expert >= DS4_N_EXPERT || markov_seen[expert]) continue;
+                markov_seen[expert] = true;
+                markov_unique++;
+
+                const uint64_t expert_id = (uint64_t)expert;
+                if (expert_id > UINT64_MAX / gate_expert_bytes ||
+                    expert_id > UINT64_MAX / down_expert_bytes) {
+                    return false;
+                }
+
+                const uint64_t gate_rel = expert_id * gate_expert_bytes;
+                const uint64_t down_rel = expert_id * down_expert_bytes;
+
+                if (gate_rel > UINT64_MAX - layer->ffn_gate_exps->abs_offset ||
+                    gate_rel > UINT64_MAX - layer->ffn_up_exps->abs_offset ||
+                    down_rel > UINT64_MAX - layer->ffn_down_exps->abs_offset) {
+                    return false;
+                }
+
+                metal_graph_stream_readahead_range_impl(model,
+                                                        layer->ffn_gate_exps->abs_offset + gate_rel,
+                                                        gate_expert_bytes,
+                                                        true);
+                metal_graph_stream_readahead_range_impl(model,
+                                                        layer->ffn_up_exps->abs_offset + gate_rel,
+                                                        gate_expert_bytes,
+                                                        true);
+                metal_graph_stream_readahead_range_impl(model,
+                                                        layer->ffn_down_exps->abs_offset + down_rel,
+                                                        down_expert_bytes,
+                                                        true);
+            }
+        }
+        if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+            fprintf(stderr,
+                    "ds4: Markov readahead layer=%u unique=%u topk=%u\n",
+                    il,
+                    markov_unique,
+                    (uint32_t)DS4_MARKOV_TOPK);
+        }
+    }
+
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
 
@@ -14269,6 +14577,9 @@ static bool metal_graph_decode_cuda_selected_load(
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+        fprintf(stderr, "ds4: entered CUDA selected load layer=%u\n", il);
+    }
     if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
         !model ||
         !g->router_selected ||
@@ -14283,6 +14594,47 @@ static bool metal_graph_decode_cuda_selected_load(
         getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
+    if (getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL &&
+        il < DS4_N_LAYER &&
+        ds4_markov_prev_valid[il]) {
+        int32_t predicted_ids[DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK];
+        uint32_t predicted_n = 0;
+        bool seen[DS4_MAX_EXPERT] = {0};
+
+        for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+            const int32_t prev = ds4_markov_prev_selected[il][mi];
+            if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+
+            for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                const uint32_t expert = ds4_markov_top8[il][(uint32_t)prev][mk];
+                if (expert >= DS4_N_EXPERT || seen[expert]) continue;
+                seen[expert] = true;
+                predicted_ids[predicted_n++] = (int32_t)expert;
+            }
+        }
+
+        if (predicted_n > 0) {
+            const ds4_gpu_stream_expert_table table =
+                graph_stream_expert_table_make(model,
+                                               layer,
+                                               il,
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
+            (void)ds4_gpu_stream_expert_cache_seed_experts(
+                        &table,
+                        predicted_ids,
+                        NULL,
+                        predicted_n);
+            if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                fprintf(stderr,
+                        "ds4: CUDA Markov selected load layer=%u predicted=%u topk=%u\n",
+                        il,
+                        predicted_n,
+                        (uint32_t)DS4_MARKOV_TOPK);
+            }
+        }
+    }
+
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
 
@@ -14293,6 +14645,51 @@ static bool metal_graph_decode_cuda_selected_load(
                                   (uint64_t)DS4_N_EXPERT_USED *
                                       sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
+
+    if (ok &&
+        getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL &&
+        getenv("DS4_MARKOV_OVERLAP_PROFILE") != NULL &&
+        il < DS4_N_LAYER &&
+        ds4_markov_prev_valid[il]) {
+        bool pred_seen[DS4_MAX_EXPERT] = {0};
+        uint32_t pred_n = 0;
+        uint32_t match_n = 0;
+
+        for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+            const int32_t prev = ds4_markov_prev_selected[il][mi];
+            if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+            for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                const uint32_t expert = ds4_markov_top8[il][(uint32_t)prev][mk];
+                if (expert >= DS4_N_EXPERT || pred_seen[expert]) continue;
+                pred_seen[expert] = true;
+                pred_n++;
+            }
+        }
+
+        for (uint32_t ai = 0; ai < DS4_N_EXPERT_USED; ai++) {
+            const int32_t actual = selected_ids[ai];
+            if (actual >= 0 &&
+                (uint32_t)actual < DS4_N_EXPERT &&
+                pred_seen[(uint32_t)actual]) {
+                match_n++;
+            }
+        }
+
+        ds4_markov_pred_total += pred_n;
+        ds4_markov_actual_total += DS4_N_EXPERT_USED;
+        ds4_markov_match_total += match_n;
+
+        fprintf(stderr,
+                "ds4: MARKOV overlap layer=%u pred=%u actual=%u match=%u rate=%.1f%% total_match=%llu total_actual=%llu total_rate=%.1f%%\n",
+                il,
+                pred_n,
+                (uint32_t)DS4_N_EXPERT_USED,
+                match_n,
+                DS4_N_EXPERT_USED ? 100.0 * (double)match_n / (double)DS4_N_EXPERT_USED : 0.0,
+                (unsigned long long)ds4_markov_match_total,
+                (unsigned long long)ds4_markov_actual_total,
+                ds4_markov_actual_total ? 100.0 * (double)ds4_markov_match_total / (double)ds4_markov_actual_total : 0.0);
+    }
 
     if (ok) {
         const ds4_gpu_stream_expert_table table =
@@ -14418,6 +14815,178 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 #endif
 }
 
+
+static pthread_mutex_t g_ds4_rl_trace_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int ds4_rl_expert_stage5_enabled(void);
+
+static __thread uint64_t ds4_rl_trace_last_seed_us = 0u;
+
+static inline uint64_t ds4_rl_trace_now_us_stage6(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000ull) + ((uint64_t)ts.tv_nsec / 1000ull);
+}
+
+#define ds4_gpu_stream_expert_cache_seed_experts(...)                         \
+    ({                                                                        \
+        const uint64_t _ds4_rl_seed_t0 = ds4_rl_trace_now_us_stage6();        \
+        __typeof__(ds4_gpu_stream_expert_cache_seed_experts(__VA_ARGS__))     \
+            _ds4_rl_seed_ret = ds4_gpu_stream_expert_cache_seed_experts(__VA_ARGS__); \
+        ds4_rl_trace_last_seed_us =                                           \
+            ds4_rl_trace_now_us_stage6() - _ds4_rl_seed_t0;                   \
+        _ds4_rl_seed_ret;                                                     \
+    })
+
+static void ds4_rl_trace_write_decode(
+        uint64_t       pos,
+        uint32_t       layer,
+        const char    *event,
+        uint32_t       prev_valid,
+        uint32_t       markov_enabled,
+        const int32_t *selected_ids,
+        uint32_t       selected_n,
+        const int32_t *predicted_ids,
+        uint32_t       predicted_n) {
+    const char *path = getenv("DS4_RL_TRACE_LOG");
+    if (!path || !path[0]) return;
+
+    uint32_t hit_n = 0;
+    if (selected_ids && selected_n && predicted_ids && predicted_n) {
+        for (uint32_t ai = 0; ai < selected_n; ai++) {
+            for (uint32_t pi = 0; pi < predicted_n; pi++) {
+                if (selected_ids[ai] == predicted_ids[pi]) {
+                    hit_n++;
+                    break;
+                }
+            }
+        }
+    }
+    const uint32_t miss_n = selected_n > hit_n ? selected_n - hit_n : 0u;
+
+    pthread_mutex_lock(&g_ds4_rl_trace_mutex);
+    FILE *fp = fopen(path, "a");
+    if (fp) {
+        fprintf(fp,
+                "%llu\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t",
+                (unsigned long long)pos,
+                layer,
+                event ? event : "",
+                prev_valid,
+                markov_enabled,
+                predicted_n,
+                selected_n,
+                hit_n,
+                miss_n);
+
+        if (selected_ids && selected_n) {
+            for (uint32_t i = 0; i < selected_n; i++) {
+                if (i) fputc(',', fp);
+                fprintf(fp, "%d", selected_ids[i]);
+            }
+        }
+
+        fputc('\t', fp);
+
+        if (predicted_ids && predicted_n) {
+            for (uint32_t i = 0; i < predicted_n; i++) {
+                if (i) fputc(',', fp);
+                fprintf(fp, "%d", predicted_ids[i]);
+            }
+        }
+
+        fprintf(fp, "\t%llu\t%u",
+            (unsigned long long)ds4_rl_trace_last_seed_us,
+            (unsigned)ds4_rl_expert_stage5_enabled());
+    ds4_rl_trace_last_seed_us = 0u;
+    fputc('\n', fp);
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&g_ds4_rl_trace_mutex);
+}
+
+
+static uint32_t ds4_rl_bandit_env_u32(
+        const char *name,
+        uint32_t    defv,
+        uint32_t    maxv) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return defv;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s) return defv;
+    if (v > maxv) v = maxv;
+    return (uint32_t)v;
+}
+
+static uint64_t ds4_rl_bandit_mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+static uint32_t ds4_rl_bandit_action_k(
+        uint64_t pos,
+        uint32_t layer,
+        uint32_t policy_k,
+        uint32_t available_k) {
+    static const uint32_t actions[] = {0u, 1u, 2u, 4u, 6u, 8u, 12u, 16u, 24u};
+    const uint32_t n_actions = (uint32_t)(sizeof(actions) / sizeof(actions[0]));
+
+    if (policy_k > available_k) policy_k = available_k;
+
+    const uint32_t eps_pct =
+        ds4_rl_bandit_env_u32("DS4_RL_BANDIT_EPSILON_PCT", 0u, 100u);
+    if (eps_pct == 0u) return policy_k;
+
+    uint64_t h = pos;
+    h ^= ((uint64_t)layer + 0x9e3779b97f4a7c15ULL) << 1;
+    h ^= ((uint64_t)policy_k + 0xbf58476d1ce4e5b9ULL) << 7;
+    h = ds4_rl_bandit_mix64(h);
+
+    if ((uint32_t)(h % 100u) >= eps_pct) return policy_k;
+
+    const uint32_t explore_mode =
+        ds4_rl_bandit_env_u32("DS4_RL_BANDIT_EXPLORE_MODE", 0u, 2u);
+
+    uint32_t action = policy_k;
+    if (explore_mode == 1u) {
+        uint32_t best_i = 0u;
+        for (uint32_t i = 0; i < n_actions; i++) {
+            if (actions[i] <= policy_k) best_i = i;
+        }
+        const uint32_t r = (uint32_t)((h >> 32) % 3u);
+        if (r == 0u && best_i > 0u) {
+            action = actions[best_i - 1u];
+        } else if (r == 2u && best_i + 1u < n_actions) {
+            action = actions[best_i + 1u];
+        } else {
+            action = actions[best_i];
+        }
+    } else {
+        action = actions[(uint32_t)((h >> 32) % n_actions)];
+    }
+
+    if (action > available_k) action = available_k;
+    return action;
+}
+
+
+static int ds4_rl_expert_stage5_enabled(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *v = getenv("DS4_RL_EXPERT_STAGE5");
+        enabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -14425,10 +14994,12 @@ typedef struct metal_graph_selected_async_load {
     const ds4_model          *model;
     const ds4_layer_weights  *layer;
     uint32_t                  il;
+    uint64_t                  pos;
     uint64_t                  event_value;
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
+    bool                      has_selected_ids;
 } metal_graph_selected_async_load;
 
 static pthread_mutex_t g_metal_graph_selected_async_load_mutex =
@@ -14452,7 +15023,7 @@ static void metal_graph_selected_async_load_run(
         DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
         return;
     }
-    if (job->event_value != 0) {
+    if (!job->has_selected_ids && job->event_value != 0) {
 #ifdef DS4_ROCM_BUILD
         if (ds4_gpu_tensor_read_after_selected_event(
                     job->g->router_selected,
@@ -14478,6 +15049,17 @@ static void metal_graph_selected_async_load_run(
         }
 #endif
     }
+    if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+        fprintf(stderr,
+                "ds4: ASYNC selected layer=%u e0=%d e1=%d e2=%d e3=%d e4=%d e5=%d\n",
+                job->il,
+                DS4_N_EXPERT_USED > 0 ? job->selected_ids[0] : -1,
+                DS4_N_EXPERT_USED > 1 ? job->selected_ids[1] : -1,
+                DS4_N_EXPERT_USED > 2 ? job->selected_ids[2] : -1,
+                DS4_N_EXPERT_USED > 3 ? job->selected_ids[3] : -1,
+                DS4_N_EXPERT_USED > 4 ? job->selected_ids[4] : -1,
+                DS4_N_EXPERT_USED > 5 ? job->selected_ids[5] : -1);
+    }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         if (job->selected_ids[i] < 0 ||
             (uint32_t)job->selected_ids[i] >= DS4_N_EXPERT) {
@@ -14495,6 +15077,120 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
+
+    if (getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL &&
+        job->il < DS4_N_LAYER &&
+        ds4_markov_prev_valid[job->il]) {
+        int32_t predicted_ids[DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK];
+        uint32_t predicted_n = 0;
+        bool seen[DS4_MAX_EXPERT] = {0};
+
+        for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+            const int32_t prev = ds4_markov_prev_selected[job->il][mi];
+            if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+
+            for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                const uint32_t expert = ds4_markov_top8[job->il][(uint32_t)prev][mk];
+                if (expert >= DS4_N_EXPERT || seen[expert]) continue;
+                seen[expert] = true;
+                predicted_ids[predicted_n++] = (int32_t)expert;
+            }
+        }
+
+        if (job->il < DS4_RL_POLICY_STAGE1_N_LAYER) {
+            if (ds4_rl_expert_stage5_enabled()) {
+                const uint32_t s5_n =
+                    ds4_rl_expert_stage5_predict(job->pos,
+                                                  job->il,
+                                                  (job->il < DS4_N_LAYER) ? ds4_markov_prev_selected[job->il] : NULL,
+                                                  DS4_N_EXPERT_USED,
+                                                  predicted_ids,
+                                                  DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK);
+                if (s5_n > 0u) predicted_n = s5_n;
+            }
+
+            const uint32_t policy_k =
+                ds4_rl_bandit_action_k(job->pos,
+                                        job->il,
+                                        ds4_rl_policy_stage4_preseed_k(job->pos, job->il, (job->il < DS4_N_LAYER) ? ds4_markov_prev_selected[job->il] : NULL, DS4_N_EXPERT_USED),
+                                        predicted_n);
+            if (policy_k < predicted_n) predicted_n = policy_k;
+        } else {
+            predicted_n = 0;
+        }
+
+        if (predicted_n > 0) {
+            (void)ds4_gpu_stream_expert_cache_seed_experts(
+                        &table,
+                        predicted_ids,
+                        NULL,
+                        predicted_n);
+            if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                fprintf(stderr,
+                        "ds4: async Markov preseed layer=%u predicted=%u topk=%u\n",
+                        job->il,
+                        predicted_n,
+                        (uint32_t)DS4_MARKOV_TOPK);
+            }
+        }
+    }
+
+    if (getenv("DS4_RL_TRACE_LOG") != NULL) {
+        int32_t rl_predicted_ids[DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK];
+        uint32_t rl_predicted_n = 0;
+        bool rl_seen[DS4_MAX_EXPERT] = {0};
+        const uint32_t rl_markov_enabled =
+            getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL ? 1u : 0u;
+        const uint32_t rl_prev_valid =
+            (job->il < DS4_N_LAYER && ds4_markov_prev_valid[job->il]) ? 1u : 0u;
+
+        if (rl_markov_enabled && rl_prev_valid) {
+            for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+                const int32_t prev = ds4_markov_prev_selected[job->il][mi];
+                if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+
+                for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                    const uint32_t expert = ds4_markov_top8[job->il][(uint32_t)prev][mk];
+                    if (expert >= DS4_N_EXPERT || rl_seen[expert]) continue;
+                    rl_seen[expert] = true;
+                    rl_predicted_ids[rl_predicted_n++] = (int32_t)expert;
+                }
+            }
+        }
+
+        if (job->il < DS4_RL_POLICY_STAGE1_N_LAYER) {
+            if (ds4_rl_expert_stage5_enabled()) {
+                const uint32_t s5_n =
+                    ds4_rl_expert_stage5_predict(job->pos,
+                                                  job->il,
+                                                  (job->il < DS4_N_LAYER) ? ds4_markov_prev_selected[job->il] : NULL,
+                                                  DS4_N_EXPERT_USED,
+                                                  rl_predicted_ids,
+                                                  DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK);
+                if (s5_n > 0u) rl_predicted_n = s5_n;
+            }
+
+            const uint32_t policy_k =
+                ds4_rl_bandit_action_k(job->pos,
+                                        job->il,
+                                        ds4_rl_policy_stage4_preseed_k(job->pos, job->il, (job->il < DS4_N_LAYER) ? ds4_markov_prev_selected[job->il] : NULL, DS4_N_EXPERT_USED),
+                                        rl_predicted_n);
+            if (policy_k < rl_predicted_n) rl_predicted_n = policy_k;
+        } else {
+            rl_predicted_n = 0;
+        }
+
+        ds4_rl_trace_write_decode(job->pos,
+                                  job->il,
+                                  "async_selected_load",
+                                  rl_prev_valid,
+                                  rl_markov_enabled,
+                                  job->selected_ids,
+                                  DS4_N_EXPERT_USED,
+                                  rl_predicted_ids,
+                                  rl_predicted_n);
+    }
+
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
                 &table,
                 job->selected_ids,
@@ -14557,6 +15253,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
         const ds4_model                 *model,
         const ds4_layer_weights         *layer,
         uint32_t                         il,
+        uint64_t                         pos,
         uint64_t                         event_value,
         uint64_t                         gate_expert_bytes,
         uint64_t                         down_expert_bytes) {
@@ -14567,6 +15264,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
     job->model = model;
     job->layer = layer;
     job->il = il;
+    job->pos = pos;
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
@@ -15553,6 +16251,8 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
+        ok = metal_graph_deepspec_capture_ffn_norm(g, g->ffn_norm, il, pos);
+        if (ok) ok = metal_graph_deepspec_capture_sequence_ffn_norm(g, g->ffn_norm, il, pos, 1);
     }
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
@@ -15587,6 +16287,63 @@ static bool metal_graph_encode_decode_layer(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
+    if (ok && il < DS4_MAX_LAYER) {
+        if (ds4_gpu_end_commands() == 0) {
+            ok = false;
+        } else {
+            int32_t markov_ids[DS4_MAX_EXPERT_USED] = {0};
+            ok = ds4_gpu_tensor_read(g->router_selected,
+                                     0,
+                                     markov_ids,
+                                     (uint64_t)DS4_N_EXPERT_USED * sizeof(markov_ids[0])) != 0;
+            if (ds4_gpu_begin_commands() == 0) ok = false;
+            if (ok) {
+                const char *train_path = getenv("DS4_MARKOV_TRAIN_LOG");
+                if (train_path && train_path[0] && ds4_markov_prev_valid[il]) {
+                    FILE *tf = fopen(train_path, "a");
+                    if (tf) {
+                        for (uint32_t pi = 0; pi < DS4_N_EXPERT_USED; pi++) {
+                            const int32_t prev = ds4_markov_prev_selected[il][pi];
+                            if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+                            for (uint32_t ni = 0; ni < DS4_N_EXPERT_USED; ni++) {
+                                const int32_t next = markov_ids[ni];
+                                if (next < 0 || (uint32_t)next >= DS4_N_EXPERT) continue;
+                                const uint32_t weight =
+                                    (DS4_N_EXPERT_USED - pi) *
+                                    (DS4_N_EXPERT_USED - ni);
+                                const int32_t prev_top1 = ds4_markov_prev_selected[il][0];
+                                const int32_t next_top1 = markov_ids[0];
+                                const uint32_t same_expert = prev == next ? 1u : 0u;
+                                const int32_t rank_delta = (int32_t)ni - (int32_t)pi;
+                                fprintf(tf,
+                                        "0\t0\t%llu\t%u\t%u\t%u\t%d\t%d\t%d\t%d\t%u\t%d\t%u\n",
+                                        (unsigned long long)pos,
+                                        il,
+                                        pi,
+                                        ni,
+                                        prev,
+                                        next,
+                                        prev_top1,
+                                        next_top1,
+                                        same_expert,
+                                        rank_delta,
+                                        weight);
+                            }
+                        }
+                        fclose(tf);
+                    }
+                }
+
+                ds4_markov_prev_valid[il] = true;
+                for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+                    ds4_markov_prev_selected[il][mi] = markov_ids[mi];
+                }
+                if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                    fprintf(stderr, "ds4: Markov prev stored layer=%u e0=%d\n", il, markov_ids[0]);
+                }
+            }
+        }
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
@@ -15646,6 +16403,16 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+    if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+        fprintf(stderr,
+                "ds4: decode path layer=%u overlap=%u async=%u delay=%u cuda_load=%u prev_valid=%u\n",
+                il,
+                overlap_selected_shared ? 1u : 0u,
+                async_selected_load ? 1u : 0u,
+                selected_readahead_shared_delay ? 1u : 0u,
+                cuda_stream_selected_load ? 1u : 0u,
+                (il < DS4_MAX_LAYER && ds4_markov_prev_valid[il]) ? 1u : 0u);
+    }
     if (cuda_stream_selected_load) {
         ok = metal_graph_decode_cuda_selected_load(g,
                                                    model,
@@ -15786,16 +16553,85 @@ static bool metal_graph_encode_decode_layer(
             async_selected_load &&
             metal_graph_use_iq2_selected_async_early_commit(g);
         if (ok && async_selected_load) {
+            if (getenv("DS4_EARLY_SELECTED_LOAD") != NULL) {
+                if (ds4_gpu_commit_and_wait_selected_readback(selected_event,
+                                                              "early selected load before worker") != 0) {
+                    int32_t early_selected[DS4_MAX_EXPERT_USED] = {0};
+                    if (ds4_gpu_tensor_read(g->router_selected,
+                                            0,
+                                            early_selected,
+                                            (uint64_t)DS4_N_EXPERT_USED * sizeof(early_selected[0])) != 0) {
+                        bool early_valid = true;
+                        for (uint32_t ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+                            if (early_selected[ei] < 0 ||
+                                (uint32_t)early_selected[ei] >= DS4_N_EXPERT) {
+                                early_valid = false;
+                                break;
+                            }
+                        }
+
+                        if (early_valid) {
+                            for (uint32_t ei = 0; ei < DS4_N_EXPERT_USED; ei++) {
+                                async_load.selected_ids[ei] = early_selected[ei];
+                            }
+                            async_load.has_selected_ids = true;
+
+                            if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                                fprintf(stderr,
+                                        "ds4: EARLY selected pass-worker layer=%u e0=%d e1=%d e2=%d e3=%d e4=%d e5=%d\n",
+                                        il,
+                                        DS4_N_EXPERT_USED > 0 ? early_selected[0] : -999,
+                                        DS4_N_EXPERT_USED > 1 ? early_selected[1] : -999,
+                                        DS4_N_EXPERT_USED > 2 ? early_selected[2] : -999,
+                                        DS4_N_EXPERT_USED > 3 ? early_selected[3] : -999,
+                                        DS4_N_EXPERT_USED > 4 ? early_selected[4] : -999,
+                                        DS4_N_EXPERT_USED > 5 ? early_selected[5] : -999);
+                            }
+                        } else if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                            fprintf(stderr,
+                                    "ds4: EARLY selected pass-worker skipped invalid layer=%u e0=%d\n",
+                                    il,
+                                    DS4_N_EXPERT_USED > 0 ? early_selected[0] : -999);
+                        }
+                    }
+                }
+            }
+
             ok = metal_graph_selected_async_load_start(&async_load,
                                                        g,
                                                        model,
                                                        layer,
                                                        il,
+                                                       pos,
                                                        selected_event,
                                                        gate_expert_bytes,
                                                        down_expert_bytes);
             async_load_started = ok;
         }
+
+        if (ok &&
+            async_selected_load &&
+            getenv("DS4_EARLY_SELECTED_DIAG") != NULL) {
+            if (ds4_gpu_commit_and_wait_selected_readback(selected_event,
+                                                          "early selected diag") != 0) {
+                int32_t early_selected[DS4_MAX_EXPERT_USED] = {0};
+                if (ds4_gpu_tensor_read(g->router_selected,
+                                        0,
+                                        early_selected,
+                                        (uint64_t)DS4_N_EXPERT_USED * sizeof(early_selected[0])) != 0) {
+                    fprintf(stderr,
+                            "ds4: EARLY selected layer=%u e0=%d e1=%d e2=%d e3=%d e4=%d e5=%d\n",
+                            il,
+                            DS4_N_EXPERT_USED > 0 ? early_selected[0] : -999,
+                            DS4_N_EXPERT_USED > 1 ? early_selected[1] : -999,
+                            DS4_N_EXPERT_USED > 2 ? early_selected[2] : -999,
+                            DS4_N_EXPERT_USED > 3 ? early_selected[3] : -999,
+                            DS4_N_EXPERT_USED > 4 ? early_selected[4] : -999,
+                            DS4_N_EXPERT_USED > 5 ? early_selected[5] : -999);
+                }
+            }
+        }
+
         if (ok && async_early_commit) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -15841,6 +16677,12 @@ static bool metal_graph_encode_decode_layer(
                                                            "selected-id shared-overlap") != 0;
         }
         if (ok && !async_load_started) {
+            if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                fprintf(stderr,
+                        "ds4: overlap non-async branch layer=%u prev_valid=%u\n",
+                        il,
+                        (il < DS4_MAX_LAYER && ds4_markov_prev_valid[il]) ? 1u : 0u);
+            }
             int32_t selected_ids[DS4_MAX_EXPERT_USED];
             ok = ds4_gpu_tensor_read(g->router_selected,
                                      0,
@@ -15855,6 +16697,143 @@ static bool metal_graph_encode_decode_layer(
                                                    il,
                                                    gate_expert_bytes,
                                                    down_expert_bytes);
+
+                if (getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL &&
+                    il < DS4_N_LAYER &&
+                    ds4_markov_prev_valid[il]) {
+                    int32_t predicted_ids[DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK];
+                    uint32_t predicted_n = 0;
+                    bool seen[DS4_MAX_EXPERT] = {0};
+
+                    for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+                        const int32_t prev = ds4_markov_prev_selected[il][mi];
+                        if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+
+                        for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                            const uint32_t expert = ds4_markov_top8[il][(uint32_t)prev][mk];
+                            if (expert >= DS4_N_EXPERT || seen[expert]) continue;
+                            seen[expert] = true;
+                            predicted_ids[predicted_n++] = (int32_t)expert;
+                        }
+                    }
+
+                    if (il < DS4_RL_POLICY_STAGE1_N_LAYER) {
+                        if (ds4_rl_expert_stage5_enabled()) {
+                            const uint32_t s5_n =
+                                ds4_rl_expert_stage5_predict(pos,
+                                                              il,
+                                                              (il < DS4_N_LAYER) ? ds4_markov_prev_selected[il] : NULL,
+                                                              DS4_N_EXPERT_USED,
+                                                              predicted_ids,
+                                                              DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK);
+                            if (s5_n > 0u) predicted_n = s5_n;
+                        }
+
+                        const uint32_t policy_k =
+                            ds4_rl_bandit_action_k(pos,
+                                                    il,
+                                                    ds4_rl_policy_stage4_preseed_k(pos, il, (il < DS4_N_LAYER) ? ds4_markov_prev_selected[il] : NULL, DS4_N_EXPERT_USED),
+                                                    predicted_n);
+                        if (policy_k < predicted_n) predicted_n = policy_k;
+                    } else {
+                        predicted_n = 0;
+                    }
+
+                    const char *eval_path = getenv("DS4_MARKOV_EVAL_LOG");
+                    if (eval_path && eval_path[0]) {
+                        uint32_t match_n = 0;
+                        for (uint32_t pi = 0; pi < predicted_n; pi++) {
+                            for (uint32_t ai = 0; ai < DS4_N_EXPERT_USED; ai++) {
+                                if (predicted_ids[pi] == selected_ids[ai]) {
+                                    match_n++;
+                                    break;
+                                }
+                            }
+                        }
+                        FILE *ef = fopen(eval_path, "a");
+                        if (ef) {
+                            fprintf(ef, "%llu\t%u\t%u\t%u\t%u\t%u\n",
+                                    (unsigned long long)pos,
+                                    il,
+                                    predicted_n,
+                                    (uint32_t)DS4_N_EXPERT_USED,
+                                    match_n,
+                                    (uint32_t)DS4_MARKOV_TOPK);
+                            fclose(ef);
+                        }
+                    }
+
+                    if (predicted_n > 0) {
+                        (void)ds4_gpu_stream_expert_cache_begin_selected_load(
+                                    &table,
+                                    predicted_ids,
+                                    predicted_n);
+                        if (getenv("DS4_MARKOV_READAHEAD_PROFILE") != NULL) {
+                            fprintf(stderr,
+                                    "ds4: CUDA Markov overlap load layer=%u predicted=%u topk=%u\n",
+                                    il,
+                                    predicted_n,
+                                    (uint32_t)DS4_MARKOV_TOPK);
+                        }
+                    }
+                }
+
+                if (getenv("DS4_RL_TRACE_LOG") != NULL) {
+                    int32_t rl_predicted_ids[DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK];
+                    uint32_t rl_predicted_n = 0;
+                    bool rl_seen[DS4_MAX_EXPERT] = {0};
+                    const uint32_t rl_markov_enabled =
+                        getenv("DS4_ENABLE_MARKOV_READAHEAD") != NULL ? 1u : 0u;
+                    const uint32_t rl_prev_valid =
+                        (il < DS4_N_LAYER && ds4_markov_prev_valid[il]) ? 1u : 0u;
+
+                    if (rl_markov_enabled && rl_prev_valid) {
+                        for (uint32_t mi = 0; mi < DS4_N_EXPERT_USED; mi++) {
+                            const int32_t prev = ds4_markov_prev_selected[il][mi];
+                            if (prev < 0 || (uint32_t)prev >= DS4_N_EXPERT) continue;
+
+                            for (uint32_t mk = 0; mk < DS4_MARKOV_TOPK; mk++) {
+                                const uint32_t expert = ds4_markov_top8[il][(uint32_t)prev][mk];
+                                if (expert >= DS4_N_EXPERT || rl_seen[expert]) continue;
+                                rl_seen[expert] = true;
+                                rl_predicted_ids[rl_predicted_n++] = (int32_t)expert;
+                            }
+                        }
+                    }
+
+                    if (il < DS4_RL_POLICY_STAGE1_N_LAYER) {
+                        if (ds4_rl_expert_stage5_enabled()) {
+                            const uint32_t s5_n =
+                                ds4_rl_expert_stage5_predict(pos,
+                                                              il,
+                                                              (il < DS4_N_LAYER) ? ds4_markov_prev_selected[il] : NULL,
+                                                              DS4_N_EXPERT_USED,
+                                                              rl_predicted_ids,
+                                                              DS4_MAX_EXPERT_USED * DS4_MARKOV_TOPK);
+                            if (s5_n > 0u) rl_predicted_n = s5_n;
+                        }
+
+                        const uint32_t policy_k =
+                            ds4_rl_bandit_action_k(pos,
+                                                    il,
+                                                    ds4_rl_policy_stage4_preseed_k(pos, il, (il < DS4_N_LAYER) ? ds4_markov_prev_selected[il] : NULL, DS4_N_EXPERT_USED),
+                                                    rl_predicted_n);
+                        if (policy_k < rl_predicted_n) rl_predicted_n = policy_k;
+                    } else {
+                        rl_predicted_n = 0;
+                    }
+
+                    ds4_rl_trace_write_decode(pos,
+                                              il,
+                                              "overlap_non_async",
+                                              rl_prev_valid,
+                                              rl_markov_enabled,
+                                              selected_ids,
+                                              DS4_N_EXPERT_USED,
+                                              rl_predicted_ids,
+                                              rl_predicted_n);
+                }
+
                 ok = ds4_gpu_stream_expert_cache_begin_selected_load(
                             &table,
                             selected_ids,
@@ -18893,6 +19872,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+        ok = metal_graph_deepspec_capture_sequence_ffn_norm(g, g->batch_ffn_norm, il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("norm");
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
@@ -19283,6 +20263,37 @@ static bool metal_graph_encode_layer_batch(
     return ok;
 }
 
+
+static bool metal_graph_deepspec_last_sequence_enabled(const ds4_gpu_graph *g) {
+    return g &&
+           g->deepspec_sequence_last_hidden &&
+           g->deepspec_sequence_last_valid &&
+           g->deepspec_sequence_token_cap != 0;
+}
+
+static bool metal_graph_deepspec_capture_sequence_last_hidden_tensor(
+        ds4_gpu_graph *g,
+        uint32_t       pos) {
+    if (!metal_graph_deepspec_last_sequence_enabled(g)) return true;
+    if (pos >= g->deepspec_sequence_token_cap) return true;
+
+    float *dst = g->deepspec_sequence_last_hidden + (uint64_t)pos * DS4_N_EMBD;
+    if (ds4_gpu_tensor_read(g->output_norm,
+                            0,
+                            dst,
+                            (uint64_t)DS4_N_EMBD * sizeof(dst[0])) == 0) {
+        fprintf(stderr, "ds4: failed to read DeepSpec output_norm sequence capture pos %u\n", pos);
+        return false;
+    }
+
+    g->deepspec_sequence_last_valid[pos] = 1;
+    if (pos + 1u > g->deepspec_last_sequence_pos_max) {
+        g->deepspec_last_sequence_pos_max = pos + 1u;
+    }
+
+    return true;
+}
+
 static bool metal_graph_eval_token_raw_swa_streaming(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -19300,6 +20311,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    const bool capture_last_hidden = metal_graph_deepspec_last_sequence_enabled(g);
 
     const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
@@ -19348,12 +20360,15 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 g->after_ffn_hc = tmp;
             }
         }
-        if (ok && logits) {
+        if (ok && (logits || capture_last_hidden)) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
         }
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
+        if (ok && capture_last_hidden) {
+            ok = metal_graph_deepspec_capture_sequence_last_hidden_tensor(g, pos);
+        }
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
@@ -19422,13 +20437,16 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     }
 
-    if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
+    if (ok && (logits || capture_last_hidden) && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
     const double t_head0 = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
-    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && (logits || capture_last_hidden)) ok = ds4_gpu_begin_commands() != 0;
+    if (ok && (logits || capture_last_hidden)) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    if (ok && (logits || capture_last_hidden)) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
+    if (ok && capture_last_hidden) {
+        ok = metal_graph_deepspec_capture_sequence_last_hidden_tensor(g, pos);
+    }
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
@@ -19473,11 +20491,17 @@ static bool metal_graph_eval_token_raw_swa(
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
+    const bool capture_last_hidden = metal_graph_deepspec_last_sequence_enabled(g);
+
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL || capture_last_hidden, true);
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
+
+    if (ok && capture_last_hidden) {
+        ok = metal_graph_deepspec_capture_sequence_last_hidden_tensor(g, pos);
+    }
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
@@ -25620,7 +26644,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const char *expert_hotlist_path = getenv("DS4_EXPERT_HOTLIST");
     if ((expert_profile_path && expert_profile_path[0]) ||
         (expert_hotlist_path && expert_hotlist_path[0])) {
-        if (e->backend == DS4_BACKEND_METAL) {
+        if (e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CPU) {
             ds4_expert_profile_init(expert_profile_path, expert_hotlist_path);
         } else {
             fprintf(stderr,
@@ -27056,10 +28080,514 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     return (int)DS4_N_VOCAB;
 }
 
+
+int ds4_session_hidden_dim(void) {
+    return (int)DS4_N_EMBD;
+}
+
+int ds4_session_copy_last_hidden_norm(ds4_session *s, float *out, int cap) {
+    if (!s || !out || cap < (int)DS4_N_EMBD) return 0;
+    if (s->distributed || ds4_session_is_cpu(s)) return 0;
+#ifdef DS4_NO_GPU
+    return 0;
+#else
+    if (!s->graph.output_norm) return 0;
+    if (ds4_gpu_tensor_read(s->graph.output_norm,
+                              0,
+                              out,
+                              (uint64_t)DS4_N_EMBD * sizeof(out[0])) == 0) {
+        return 0;
+    }
+    return (int)DS4_N_EMBD;
+#endif
+}
+
+
+int ds4_session_copy_deepspec_layer_hidden_norms(ds4_session *s,
+                                                  int *layer_ids, int max_layers,
+                                                  float *out, int cap,
+                                                  int *hidden_dim,
+                                                  int *position) {
+    if (hidden_dim) *hidden_dim = 0;
+    if (position) *position = -1;
+    if (!s || s->distributed || ds4_session_is_cpu(s)) return 0;
+#ifdef DS4_NO_GPU
+    (void)layer_ids;
+    (void)max_layers;
+    (void)out;
+    (void)cap;
+    return 0;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->deepspec_capture_hidden || g->deepspec_capture_n == 0) return 0;
+
+    const int dim = (int)DS4_N_EMBD;
+    if (hidden_dim) *hidden_dim = dim;
+    if (position) *position = (g->deepspec_capture_pos == UINT32_MAX) ? -1 : (int)g->deepspec_capture_pos;
+
+    int written = 0;
+    for (uint32_t slot = 0; slot < g->deepspec_capture_n; slot++) {
+        if ((g->deepspec_capture_valid_mask & (1u << slot)) == 0) continue;
+
+        if (layer_ids && written < max_layers) layer_ids[written] = (int)g->deepspec_capture_layer_ids[slot];
+        if (out) {
+            if (cap < (written + 1) * dim) return 0;
+            memcpy(out + (uint64_t)written * dim,
+                   g->deepspec_capture_hidden + (uint64_t)slot * DS4_N_EMBD,
+                   (size_t)dim * sizeof(out[0]));
+        }
+        written++;
+    }
+
+    return written;
+#endif
+}
+
+
+int ds4_session_copy_deepspec_sequence_summary(ds4_session *s,
+                                                int *layer_ids, int max_layers,
+                                                int *seq_len,
+                                                int *hidden_dim,
+                                                int *token_cap,
+                                                int *tokens_per_layer,
+                                                double *stats,
+                                                float *last_values,
+                                                int last_values_limit) {
+    if (seq_len) *seq_len = 0;
+    if (hidden_dim) *hidden_dim = 0;
+    if (token_cap) *token_cap = 0;
+    if (!s || s->distributed || ds4_session_is_cpu(s)) return 0;
+#ifdef DS4_NO_GPU
+    (void)layer_ids;
+    (void)max_layers;
+    (void)tokens_per_layer;
+    (void)stats;
+    (void)last_values;
+    (void)last_values_limit;
+    return 0;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->deepspec_sequence_layer_hidden || !g->deepspec_sequence_layer_valid ||
+        g->deepspec_capture_n == 0 || g->deepspec_sequence_token_cap == 0) {
+        return 0;
+    }
+
+    const int dim = (int)DS4_N_EMBD;
+    const int cap = (int)g->deepspec_sequence_token_cap;
+    const int n = (int)g->deepspec_capture_n;
+    const int out_n = n < max_layers ? n : max_layers;
+    if (seq_len) *seq_len = (int)g->deepspec_sequence_pos_max;
+    if (hidden_dim) *hidden_dim = dim;
+    if (token_cap) *token_cap = cap;
+
+    for (int slot = 0; slot < out_n; slot++) {
+        if (layer_ids) layer_ids[slot] = (int)g->deepspec_capture_layer_ids[slot];
+
+        int count_tok = 0;
+        int last_tok = -1;
+        double sum = 0.0;
+        double sum2 = 0.0;
+        float minv = 0.0f;
+        float maxv = 0.0f;
+        bool have = false;
+
+        for (int t = 0; t < cap; t++) {
+            const uint8_t vbit = g->deepspec_sequence_layer_valid[(uint64_t)slot * cap + t];
+            if (!vbit) continue;
+            count_tok++;
+            last_tok = t;
+            const float *row = g->deepspec_sequence_layer_hidden +
+                               ((uint64_t)slot * cap + (uint32_t)t) * DS4_N_EMBD;
+            for (int j = 0; j < dim; j++) {
+                const float v = row[j];
+                if (!have) {
+                    minv = maxv = v;
+                    have = true;
+                } else {
+                    if (v < minv) minv = v;
+                    if (v > maxv) maxv = v;
+                }
+                sum += (double)v;
+                sum2 += (double)v * (double)v;
+            }
+        }
+
+        if (tokens_per_layer) tokens_per_layer[slot] = count_tok;
+        if (stats) {
+            const double denom = count_tok > 0 ? (double)count_tok * (double)dim : 1.0;
+            stats[(uint64_t)slot * 4 + 0] = count_tok > 0 ? sum / denom : 0.0;
+            stats[(uint64_t)slot * 4 + 1] = count_tok > 0 ? sqrt(sum2 / denom) : 0.0;
+            stats[(uint64_t)slot * 4 + 2] = count_tok > 0 ? (double)minv : 0.0;
+            stats[(uint64_t)slot * 4 + 3] = count_tok > 0 ? (double)maxv : 0.0;
+        }
+
+        if (last_values && last_values_limit > 0) {
+            float *dst = last_values + (uint64_t)slot * last_values_limit;
+            for (int j = 0; j < last_values_limit; j++) dst[j] = 0.0f;
+            if (last_tok >= 0) {
+                const float *row = g->deepspec_sequence_layer_hidden +
+                                   ((uint64_t)slot * cap + (uint32_t)last_tok) * DS4_N_EMBD;
+                const int m = last_values_limit < dim ? last_values_limit : dim;
+                memcpy(dst, row, (size_t)m * sizeof(dst[0]));
+            }
+        }
+    }
+
+    return out_n;
+#endif
+}
+
+
+int ds4_session_copy_deepspec_last_sequence_summary(ds4_session *s,
+                                                     int *seq_len,
+                                                     int *hidden_dim,
+                                                     int *token_cap,
+                                                     int *tokens_captured,
+                                                     double *stats,
+                                                     float *last_values,
+                                                     int last_values_limit) {
+    if (seq_len) *seq_len = 0;
+    if (hidden_dim) *hidden_dim = 0;
+    if (token_cap) *token_cap = 0;
+    if (tokens_captured) *tokens_captured = 0;
+    if (!s || s->distributed || ds4_session_is_cpu(s)) return 0;
+#ifdef DS4_NO_GPU
+    (void)stats;
+    (void)last_values;
+    (void)last_values_limit;
+    return 0;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->deepspec_sequence_last_hidden || !g->deepspec_sequence_last_valid ||
+        g->deepspec_sequence_token_cap == 0) {
+        return 0;
+    }
+
+    const int dim = (int)DS4_N_EMBD;
+    const int cap = (int)g->deepspec_sequence_token_cap;
+    if (seq_len) *seq_len = (int)g->deepspec_last_sequence_pos_max;
+    if (hidden_dim) *hidden_dim = dim;
+    if (token_cap) *token_cap = cap;
+
+    int count_tok = 0;
+    int last_tok = -1;
+    double sum = 0.0;
+    double sum2 = 0.0;
+    float minv = 0.0f;
+    float maxv = 0.0f;
+    bool have = false;
+
+    for (int t = 0; t < cap; t++) {
+        if (!g->deepspec_sequence_last_valid[t]) continue;
+        count_tok++;
+        last_tok = t;
+        const float *row = g->deepspec_sequence_last_hidden + (uint64_t)t * DS4_N_EMBD;
+        for (int j = 0; j < dim; j++) {
+            const float v = row[j];
+            if (!have) {
+                minv = maxv = v;
+                have = true;
+            } else {
+                if (v < minv) minv = v;
+                if (v > maxv) maxv = v;
+            }
+            sum += (double)v;
+            sum2 += (double)v * (double)v;
+        }
+    }
+
+    if (tokens_captured) *tokens_captured = count_tok;
+    if (stats) {
+        const double denom = count_tok > 0 ? (double)count_tok * (double)dim : 1.0;
+        stats[0] = count_tok > 0 ? sum / denom : 0.0;
+        stats[1] = count_tok > 0 ? sqrt(sum2 / denom) : 0.0;
+        stats[2] = count_tok > 0 ? (double)minv : 0.0;
+        stats[3] = count_tok > 0 ? (double)maxv : 0.0;
+    }
+
+    if (last_values && last_values_limit > 0) {
+        for (int j = 0; j < last_values_limit; j++) last_values[j] = 0.0f;
+        if (last_tok >= 0) {
+            const float *row = g->deepspec_sequence_last_hidden + (uint64_t)last_tok * DS4_N_EMBD;
+            const int m = last_values_limit < dim ? last_values_limit : dim;
+            memcpy(last_values, row, (size_t)m * sizeof(last_values[0]));
+        }
+    }
+
+    return count_tok > 0 ? 1 : 0;
+#endif
+}
+
+
+static bool ds4_deepspec_file_path(char *out, size_t outlen, const char *prefix, const char *suffix) {
+    if (!out || outlen == 0 || !prefix || !prefix[0] || !suffix) return false;
+    int n = snprintf(out, outlen, "%s%s", prefix, suffix);
+    return n > 0 && (size_t)n < outlen;
+}
+
+static bool ds4_deepspec_write_all_fp(FILE *fp, const void *data, size_t bytes) {
+    if (bytes == 0) return true;
+    return fwrite(data, 1, bytes, fp) == bytes;
+}
+
+static bool ds4_deepspec_write_i32_file(const char *path, const int *data, int n) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    const bool ok = n <= 0 || ds4_deepspec_write_all_fp(fp, data, (size_t)n * sizeof(data[0]));
+    if (fclose(fp) != 0) return false;
+    return ok;
+}
+
+int ds4_session_dump_deepspec_sequence_raw(ds4_session *s,
+                                           const char *prefix,
+                                           char *err,
+                                           size_t errlen) {
+    if (errlen) err[0] = '\0';
+    if (!s || !prefix || !prefix[0]) {
+        if (errlen) snprintf(err, errlen, "invalid arguments");
+        return 1;
+    }
+    if (s->distributed || ds4_session_is_cpu(s)) {
+        if (errlen) snprintf(err, errlen, "DeepSpec raw dump requires local GPU session");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->deepspec_sequence_layer_hidden ||
+        !g->deepspec_sequence_layer_valid ||
+        !g->deepspec_sequence_last_hidden ||
+        !g->deepspec_sequence_last_valid ||
+        g->deepspec_capture_n == 0 ||
+        g->deepspec_sequence_token_cap == 0) {
+        if (errlen) snprintf(err, errlen, "DeepSpec sequence capture is not available");
+        return 1;
+    }
+
+    const uint32_t hidden_dim = DS4_N_EMBD;
+    const uint32_t n_layers = g->deepspec_capture_n;
+    const uint32_t cap = g->deepspec_sequence_token_cap;
+    uint32_t seq = g->deepspec_sequence_pos_max;
+    if (g->deepspec_last_sequence_pos_max < seq) seq = g->deepspec_last_sequence_pos_max;
+    if ((uint32_t)s->checkpoint.len < seq) seq = (uint32_t)s->checkpoint.len;
+    if (seq > cap) seq = cap;
+
+    uint32_t valid_seq = 0;
+    for (uint32_t t = 0; t < seq; t++) {
+        bool ok = true;
+        for (uint32_t slot = 0; ok && slot < n_layers; slot++) {
+            ok = g->deepspec_sequence_layer_valid[(uint64_t)slot * cap + t] != 0;
+        }
+        if (!ok) break;
+        valid_seq++;
+    }
+    seq = valid_seq;
+
+    if (seq == 0) {
+        if (errlen) snprintf(err, errlen, "no contiguous DeepSpec sequence captured");
+        return 1;
+    }
+
+    char meta_path[4096];
+    char tokens_path[4096];
+    char target_hidden_path[4096];
+    char target_last_path[4096];
+
+    if (!ds4_deepspec_file_path(meta_path, sizeof(meta_path), prefix, ".meta.json") ||
+        !ds4_deepspec_file_path(tokens_path, sizeof(tokens_path), prefix, ".input_ids.i32") ||
+        !ds4_deepspec_file_path(target_hidden_path, sizeof(target_hidden_path), prefix, ".target_hidden.f32") ||
+        !ds4_deepspec_file_path(target_last_path, sizeof(target_last_path), prefix, ".target_last_hidden.f32")) {
+        if (errlen) snprintf(err, errlen, "output path is too long");
+        return 1;
+    }
+
+    if (!ds4_deepspec_write_i32_file(tokens_path, s->checkpoint.v, (int)seq)) {
+        if (errlen) snprintf(err, errlen, "failed to write %s", tokens_path);
+        return 1;
+    }
+
+    {
+        char last_valid_path[4096];
+        if (ds4_deepspec_file_path(last_valid_path, sizeof(last_valid_path), prefix, ".last_valid.u8")) {
+            FILE *fv = fopen(last_valid_path, "wb");
+            if (fv) {
+                ds4_deepspec_write_all_fp(fv, g->deepspec_sequence_last_valid, (size_t)seq);
+                fclose(fv);
+            }
+        }
+    }
+
+    FILE *fh = fopen(target_hidden_path, "wb");
+    if (!fh) {
+        if (errlen) snprintf(err, errlen, "failed to open %s", target_hidden_path);
+        return 1;
+    }
+    bool ok_hidden = true;
+    for (uint32_t t = 0; ok_hidden && t < seq; t++) {
+        for (uint32_t slot = 0; ok_hidden && slot < n_layers; slot++) {
+            const float *row = g->deepspec_sequence_layer_hidden +
+                               ((uint64_t)slot * cap + t) * hidden_dim;
+            ok_hidden = ds4_deepspec_write_all_fp(fh, row, (size_t)hidden_dim * sizeof(row[0]));
+        }
+    }
+    if (fclose(fh) != 0) ok_hidden = false;
+    if (!ok_hidden) {
+        if (errlen) snprintf(err, errlen, "failed to write %s", target_hidden_path);
+        return 1;
+    }
+
+    FILE *fl = fopen(target_last_path, "wb");
+    if (!fl) {
+        if (errlen) snprintf(err, errlen, "failed to open %s", target_last_path);
+        return 1;
+    }
+    bool ok_last = true;
+    for (uint32_t t = 0; ok_last && t < seq; t++) {
+        const float *row = g->deepspec_sequence_last_hidden + (uint64_t)t * hidden_dim;
+        ok_last = ds4_deepspec_write_all_fp(fl, row, (size_t)hidden_dim * sizeof(row[0]));
+    }
+    if (fclose(fl) != 0) ok_last = false;
+    if (!ok_last) {
+        if (errlen) snprintf(err, errlen, "failed to write %s", target_last_path);
+        return 1;
+    }
+
+    FILE *fm = fopen(meta_path, "wb");
+    if (!fm) {
+        if (errlen) snprintf(err, errlen, "failed to open %s", meta_path);
+        return 1;
+    }
+
+    fprintf(fm, "{\n");
+    fprintf(fm, "  \"format\": \"ds4_deepspec_raw_sequence_v1\",\n");
+    fprintf(fm, "  \"dtype\": \"float32\",\n");
+    fprintf(fm, "  \"token_dtype\": \"int32\",\n");
+    fprintf(fm, "  \"seq_len\": %u,\n", seq);
+    fprintf(fm, "  \"hidden_dim\": %u,\n", hidden_dim);
+    fprintf(fm, "  \"num_target_layers\": %u,\n", n_layers);
+    fprintf(fm, "  \"target_layer_ids\": [");
+    for (uint32_t i = 0; i < n_layers; i++) {
+        fprintf(fm, "%s%u", i ? "," : "", g->deepspec_capture_layer_ids[i]);
+    }
+    fprintf(fm, "],\n");
+    fprintf(fm, "  \"target_hidden_shape\": [%u, %u],\n", seq, n_layers * hidden_dim);
+    fprintf(fm, "  \"target_last_hidden_shape\": [%u, %u],\n", seq, hidden_dim);
+    fprintf(fm, "  \"layout\": \"target_hidden is seq-major concat(layer-major selected layers per token)\",\n");
+    fprintf(fm, "  \"files\": {\n");
+    fprintf(fm, "    \"input_ids\": \"%s\",\n", tokens_path);
+    fprintf(fm, "    \"target_hidden_states\": \"%s\",\n", target_hidden_path);
+    fprintf(fm, "    \"target_last_hidden_states\": \"%s\"\n", target_last_path);
+    fprintf(fm, "  }\n");
+    fprintf(fm, "}\n");
+    if (fclose(fm) != 0) {
+        if (errlen) snprintf(err, errlen, "failed to write %s", meta_path);
+        return 1;
+    }
+
+    return 0;
+#endif
+}
+
+
+int ds4_session_deepspec_reset_sample(ds4_session *s) {
+    if (!s) return 1;
+
+    s->checkpoint.len = 0;
+    s->checkpoint_valid = false;
+
+#ifndef DS4_NO_GPU
+    if (!s->distributed && !ds4_session_is_cpu(s)) {
+        ds4_gpu_graph *g = &s->graph;
+
+        /* A new logical sample must not inherit the SSD streaming map state
+         * from the preceding request.  The mapped addresses remain valid, but
+         * the "current" shortcut can otherwise skip the first remap and make a
+         * split continuation follow a different numerical path. */
+        g->streaming_static_decode_map_current = false;
+
+        g->deepspec_capture_valid_mask = 0;
+        g->deepspec_capture_pos = 0;
+        if (g->deepspec_capture_hidden && g->deepspec_capture_n) {
+            memset(g->deepspec_capture_hidden,
+                   0,
+                   (size_t)g->deepspec_capture_n * DS4_N_EMBD * sizeof(g->deepspec_capture_hidden[0]));
+        }
+
+        g->deepspec_sequence_pos_max = 0;
+        g->deepspec_last_sequence_pos_max = 0;
+
+        if (g->deepspec_sequence_layer_valid &&
+            g->deepspec_sequence_token_cap &&
+            g->deepspec_capture_n) {
+            memset(g->deepspec_sequence_layer_valid,
+                   0,
+                   (size_t)g->deepspec_sequence_token_cap *
+                   g->deepspec_capture_n *
+                   sizeof(g->deepspec_sequence_layer_valid[0]));
+        }
+        if (g->deepspec_sequence_last_valid && g->deepspec_sequence_token_cap) {
+            memset(g->deepspec_sequence_last_valid,
+                   0,
+                   (size_t)g->deepspec_sequence_token_cap *
+                   sizeof(g->deepspec_sequence_last_valid[0]));
+        }
+
+        if (g->deepspec_sequence_layer_hidden &&
+            g->deepspec_sequence_token_cap &&
+            g->deepspec_capture_n) {
+            memset(g->deepspec_sequence_layer_hidden,
+                   0,
+                   (size_t)g->deepspec_sequence_token_cap *
+                   g->deepspec_capture_n *
+                   DS4_N_EMBD *
+                   sizeof(g->deepspec_sequence_layer_hidden[0]));
+        }
+        if (g->deepspec_sequence_last_hidden && g->deepspec_sequence_token_cap) {
+            memset(g->deepspec_sequence_last_hidden,
+                   0,
+                   (size_t)g->deepspec_sequence_token_cap *
+                   DS4_N_EMBD *
+                   sizeof(g->deepspec_sequence_last_hidden[0]));
+        }
+    }
+#endif
+
+    return 0;
+}
+
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
+}
+
+
+static int ds4_session_capture_deepspec_last_sequence_norm(ds4_session *s, uint32_t pos) {
+    if (!s || s->distributed || ds4_session_is_cpu(s)) return 0;
+#ifdef DS4_NO_GPU
+    (void)pos;
+    return 0;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->deepspec_sequence_last_hidden || !g->deepspec_sequence_last_valid ||
+        g->deepspec_sequence_token_cap == 0 || !g->output_norm) {
+        return 0;
+    }
+    if (pos >= g->deepspec_sequence_token_cap) return 0;
+
+    float *dst = g->deepspec_sequence_last_hidden + (uint64_t)pos * DS4_N_EMBD;
+    if (ds4_gpu_tensor_read(g->output_norm, 0, dst, (uint64_t)DS4_N_EMBD * sizeof(dst[0])) == 0) {
+        return 1;
+    }
+
+    g->deepspec_sequence_last_valid[pos] = 1;
+    if (pos + 1u > g->deepspec_last_sequence_pos_max) {
+        g->deepspec_last_sequence_pos_max = pos + 1u;
+    }
+    return 0;
+#endif
 }
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -27128,6 +28656,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                         s->logits))
     {
         snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    if (ds4_session_capture_deepspec_last_sequence_norm(s, (uint32_t)s->checkpoint.len) != 0) {
+        snprintf(err, errlen, "DeepSpec output_norm sequence capture failed");
         s->checkpoint_valid = false;
         return 1;
     }
@@ -27764,6 +29297,88 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return n_accept;
 #endif
 }
+
+/*
+ * DeepSpec external draft verifier, exact argmax baseline.
+ *
+ * Contract:
+ *   - draft_tokens are proposed next-token ids from an external draft model.
+ *   - The target stream is authoritative.
+ *   - We compare each draft token against the current target argmax.
+ *   - Accepted draft tokens are committed to the session with ds4_session_eval().
+ *   - On first mismatch, the target argmax token is committed instead.
+ *   - If every draft token is accepted, one extra target argmax token is
+ *     committed, matching the usual speculative decoding contract:
+ *       commit accepted_draft_prefix + next_target_token.
+ *
+ * This DS-1 implementation is intentionally sequential and correctness-first.
+ * Later DS-2/DS-3 can replace the inner verification with the existing GPU
+ * microbatch verifier once the HTTP/API contract is stable.
+ *
+ * Return value:
+ *   number of committed token ids written to committed[], or -1 on error.
+ *   *accepted_draft_tokens receives the number of draft tokens accepted.
+ */
+int ds4_session_verify_draft_argmax(ds4_session *s,
+                                     const int *draft_tokens, int n_draft,
+                                     int eos_token,
+                                     int *committed, int committed_cap,
+                                     int *accepted_draft_tokens,
+                                     char *err, size_t errlen) {
+    if (accepted_draft_tokens) *accepted_draft_tokens = 0;
+    if (!s || !committed || committed_cap <= 0) return 0;
+    if (n_draft < 0) n_draft = 0;
+
+    int committed_n = 0;
+    int accepted_n = 0;
+
+    for (int i = 0; i < n_draft && committed_n < committed_cap; i++) {
+        const int target_top = ds4_session_argmax(s);
+        if (target_top < 0) {
+            if (err && errlen) snprintf(err, errlen, "target argmax failed");
+            return -1;
+        }
+
+        if (target_top != draft_tokens[i]) {
+            committed[committed_n++] = target_top;
+            if (target_top != eos_token) {
+                if (ds4_session_eval(s, target_top, err, errlen) != 0) return -1;
+            }
+            if (accepted_draft_tokens) *accepted_draft_tokens = accepted_n;
+            return committed_n;
+        }
+
+        committed[committed_n++] = draft_tokens[i];
+        accepted_n++;
+        if (accepted_draft_tokens) *accepted_draft_tokens = accepted_n;
+
+        if (draft_tokens[i] == eos_token) {
+            return committed_n;
+        }
+
+        if (ds4_session_eval(s, draft_tokens[i], err, errlen) != 0) return -1;
+    }
+
+    /*
+     * All supplied draft tokens were accepted. Commit one target token after
+     * the accepted prefix, unless the output buffer is full.
+     */
+    if (committed_n < committed_cap) {
+        const int target_top = ds4_session_argmax(s);
+        if (target_top < 0) {
+            if (err && errlen) snprintf(err, errlen, "target argmax failed");
+            return -1;
+        }
+        committed[committed_n++] = target_top;
+        if (target_top != eos_token) {
+            if (ds4_session_eval(s, target_top, err, errlen) != 0) return -1;
+        }
+    }
+
+    if (accepted_draft_tokens) *accepted_draft_tokens = accepted_n;
+    return committed_n;
+}
+
 
 void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
