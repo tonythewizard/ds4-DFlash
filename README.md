@@ -1,4 +1,13 @@
-# DwarfStar
+# ds4-DFlash
+
+**Correctness-first DS4 fork with native dFlash speculative decoding, DeepSpec integration, CUDA low-memory inference, SSD streaming, continual-learning tooling, and a bilingual terminal UI.**
+
+> **Validation status:** the complete stack is currently validated only on CUDA `sm_86` with an NVIDIA RTX 3070 Ti. Metal, Apple Silicon—including M3—ROCm, other CUDA architectures, and CPU-only deployment still require backend-specific validation.
+
+See [docs/DS4_DFLASH.md](docs/DS4_DFLASH.md) for features, architecture, validation results, build instructions, limitations, and roadmap.
+
+## Upstream project: DwarfStar
+
 
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
