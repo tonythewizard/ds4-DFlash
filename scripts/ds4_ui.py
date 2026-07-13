@@ -34,10 +34,18 @@ LAUNCHER = Path(
     os.environ.get("DS4_CONTINUAL_LAUNCHER", str(Path.home() / ".local/bin/ds4-continual"))
 ).expanduser()
 
-LANGUAGE_INSTRUCTIONS = {
-    "en": "Use English for both visible reasoning and the final answer unless the user explicitly requests another language.",
-    "it": "Usa l'italiano sia per il ragionamento visibile sia per la risposta finale, salvo richiesta esplicita dell'utente di usare un'altra lingua.",
+THINKING_LANGUAGE_INSTRUCTIONS = {
+    False: {
+        "en": "Respond in English unless the user explicitly requests another language.",
+        "it": "Rispondi in italiano salvo richiesta esplicita dell'utente di usare un'altra lingua.",
+    },
+    True: {
+        "en": "Use English for both visible reasoning and the final answer unless the user explicitly requests another language.",
+        "it": "Usa l'italiano sia per il ragionamento visibile sia per la risposta finale, salvo richiesta esplicita dell'utente di usare un'altra lingua.",
+    },
 }
+# Compatibility name retained for callers that imported the pre-toggle table.
+LANGUAGE_INSTRUCTIONS = THINKING_LANGUAGE_INSTRUCTIONS[True]
 LEGACY_LANGUAGE_INSTRUCTIONS = {
     "Respond in English unless the user explicitly requests another language.",
     "Rispondi in italiano salvo richiesta esplicita dell'utente di usare un'altra lingua.",
@@ -57,8 +65,13 @@ UI_TEXT = {
         "empty_answer": "[empty response]",
         "thinking_title": "THINKING",
         "thinking_empty": "No thinking stream received",
+        "thinking_disabled": "Thinking disabled",
+        "thinking_status": "Thinking is {state}. Usage: /thinking on|off",
+        "thinking_enabled": "Thinking enabled.",
+        "thinking_disabled_confirm": "Thinking disabled.",
+        "thinking_usage": "Usage: /thinking on|off",
         "unknown": "Unknown command: {command}. Use /help",
-        "help": "/dflash on  /dflash off  /dflash auto\n/language  /language en  /language it  /reset\n/max-tokens  /max-tokens N  /fallback on|off\n/recover on|off|now  /stats  /status  /buffer  /training  /clearstats  /quit",
+        "help": "/dflash on  /dflash off  /dflash auto\n/thinking  /thinking on  /thinking off\n/language  /language en  /language it  /reset\n/max-tokens  /max-tokens N  /fallback on|off\n/recover on|off|now  /stats  /status  /buffer  /training  /clearstats  /quit",
         "language_status": "Current language: {language}. Choices: en, it. Usage: /language en|it",
         "language_set": "Language set to English.",
         "language_invalid": "Unsupported language. Use /language en or /language it.",
@@ -95,8 +108,13 @@ UI_TEXT = {
         "empty_answer": "[risposta vuota]",
         "thinking_title": "RAGIONAMENTO",
         "thinking_empty": "Nessun flusso di ragionamento ricevuto",
+        "thinking_disabled": "Ragionamento disattivato",
+        "thinking_status": "Il ragionamento è {state}. Uso: /thinking on|off",
+        "thinking_enabled": "Ragionamento attivato.",
+        "thinking_disabled_confirm": "Ragionamento disattivato.",
+        "thinking_usage": "Uso: /thinking on|off",
         "unknown": "Comando sconosciuto: {command}. Usa /help",
-        "help": "/dflash on  /dflash off  /dflash auto\n/language  /language en  /language it  /reset\n/max-tokens  /max-tokens N  /fallback on|off\n/recover on|off|now  /stats  /status  /buffer  /training  /clearstats  /quit",
+        "help": "/dflash on  /dflash off  /dflash auto\n/thinking  /thinking on  /thinking off\n/language  /language en  /language it  /reset\n/max-tokens  /max-tokens N  /fallback on|off\n/recover on|off|now  /stats  /status  /buffer  /training  /clearstats  /quit",
         "language_status": "Lingua corrente: {language}. Scelte: en, it. Uso: /language en|it",
         "language_set": "Lingua impostata su italiano.",
         "language_invalid": "Lingua non supportata. Usa /language en o /language it.",
@@ -138,16 +156,30 @@ def ui_text(locale: str, key: str, **values: Any) -> str:
 
 
 def build_request_messages(
-    history: list[dict[str, str]], language: str
+    history: list[dict[str, str]], language: str, thinking_enabled: bool = False
 ) -> list[dict[str, str]]:
-    instructions = set(LANGUAGE_INSTRUCTIONS.values()) | LEGACY_LANGUAGE_INSTRUCTIONS
+    instructions = {
+        instruction
+        for mode in THINKING_LANGUAGE_INSTRUCTIONS.values()
+        for instruction in mode.values()
+    } | LEGACY_LANGUAGE_INSTRUCTIONS
     cleaned = [
         dict(message) for message in history
         if not (message.get("role") == "system" and message.get("content") in instructions)
     ]
     insert_at = 1 if cleaned and cleaned[0].get("role") == "system" else 0
-    cleaned.insert(insert_at, {"role": "system", "content": LANGUAGE_INSTRUCTIONS[language]})
+    instruction = THINKING_LANGUAGE_INSTRUCTIONS[bool(thinking_enabled)][language]
+    cleaned.insert(insert_at, {"role": "system", "content": instruction})
     return cleaned
+
+
+def apply_thinking_control(payload: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    """Return a request with exactly one canonical backend thinking control."""
+    controlled = dict(payload)
+    for key in ("thinking", "think", "reasoning_effort"):
+        controlled.pop(key, None)
+    controlled["thinking"] = bool(enabled)
+    return controlled
 
 
 def _finite_number(value: Any) -> float | None:
@@ -297,9 +329,12 @@ def parse_assistant_responses(responses: list[dict[str, Any]]) -> AssistantConte
     return parser.finish()
 
 
-def thinking_box_lines(content: str, language: str, width: int) -> list[str]:
+def thinking_box_lines(
+    content: str, language: str, width: int, thinking_enabled: bool = True
+) -> list[str]:
     title = ui_text(language, "thinking_title")
-    body = ANSI_ESCAPE_RE.sub("", content).strip() or ui_text(language, "thinking_empty")
+    placeholder = "thinking_empty" if thinking_enabled else "thinking_disabled"
+    body = ANSI_ESCAPE_RE.sub("", content).strip() or ui_text(language, placeholder)
     inner = max(12, width - 4)
     top_label = f" {title} "
     top = "╭" + top_label + "─" * max(0, inner - len(top_label) + 1) + "╮"
@@ -649,6 +684,7 @@ class DS4TUI:
         self.busy = False
         self.phase = "IDLE"
         self.dflash_mode = args.dflash
+        self.thinking_enabled = bool(getattr(args, "thinking", False))
         self.fallback_enabled = True
         self.auto_recover = True
         self.last = TurnStats()
@@ -667,27 +703,27 @@ class DS4TUI:
         self.transcript.append((role, text))
         self.scroll = 0
 
-    def add_thinking(self, text: str) -> None:
-        self.add_line(f"THINKING:{self.language}", text)
+    def add_thinking(self, text: str, enabled: bool | None = None) -> None:
+        selected = self.thinking_enabled if enabled is None else bool(enabled)
+        mode = "on" if selected else "off"
+        self.add_line(f"THINKING:{self.language}:{mode}", text)
 
     def outgoing_messages(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
-        return build_request_messages(history, self.language)
+        return build_request_messages(history, self.language, self.thinking_enabled)
 
     def chat_payload(self, history: list[dict[str, str]]) -> dict[str, Any]:
-        return {
+        payload = {
             "model": "ds4",
             "messages": self.outgoing_messages(history),
             "max_tokens": self.args.max_tokens,
             "temperature": self.args.temperature,
             "seed": self.args.seed,
-            # DFlash correctness-first is greedy. Explicitly disable target
-            # thinking because that mode forces stochastic sampling server-side.
-            "thinking": False,
             "stream": self.args.stream,
             "stream_options": {"include_usage": True},
             "ds4_return_runtime_metrics": True,
             "ds4_return_token_ids": True,
         }
+        return apply_thinking_control(payload, self.thinking_enabled)
 
     def set_status(self, text: str) -> None:
         self.status_message = text
@@ -781,6 +817,21 @@ class DS4TUI:
 
         raise RuntimeError(" | ".join(errors))
 
+    def dflash_continuation_payload(
+        self, payload: dict[str, Any], remaining_tokens: int
+    ) -> dict[str, Any]:
+        enabled = bool(payload.get("thinking"))
+        return apply_thinking_control({
+            "max_tokens": max(1, remaining_tokens),
+            "temperature": self.args.temperature,
+            "seed": self.args.seed,
+            "spec_top_k": self.args.top_k,
+            "sidecar_url": self.sidecar_generate,
+            "reasoning_active": enabled,
+            "ds4_return_runtime_metrics": True,
+            "ds4_return_token_ids": True,
+        }, enabled)
+
     def dflash_chat(self, payload: dict[str, Any]) -> tuple[AssistantContent, TurnStats]:
         started = time.perf_counter()
         reset, _ = http_json(
@@ -813,18 +864,9 @@ class DS4TUI:
         if not isinstance(usage, dict):
             usage = {}
 
-        prefill_content = parse_assistant_responses([prefill])
-        reasoning_active = bool(prefill_content.thinking and not prefill_content.final)
-        dflash_request = {
-            "max_tokens": max(1, requested_max_tokens - prefill_tokens),
-            "temperature": self.args.temperature,
-            "seed": self.args.seed,
-            "spec_top_k": self.args.top_k,
-            "sidecar_url": self.sidecar_generate,
-            "reasoning_active": reasoning_active,
-            "ds4_return_runtime_metrics": True,
-            "ds4_return_token_ids": True,
-        }
+        dflash_request = self.dflash_continuation_payload(
+            payload, requested_max_tokens - prefill_tokens
+        )
         # The endpoint call above is kept close to request construction so OFF,
         # ON and fallback all feed the same response normalizer.
         dflash, generation_wall = http_json(
@@ -924,6 +966,7 @@ class DS4TUI:
                 {
                     "prompt": prompt,
                     "thinking": answer.thinking,
+                    "thinking_enabled": bool(payload.get("thinking")),
                     "answer": answer.final,
                     "messages": tentative,
                     "stats": asdict(stats),
@@ -984,6 +1027,18 @@ class DS4TUI:
                 )
             else:
                 self.add_line("SYS", ui_text(self.language, "dflash_usage"))
+            return
+
+        if head == "/thinking":
+            if len(parts) == 1:
+                state = "ON" if self.thinking_enabled else "OFF"
+                self.add_line("SYS", ui_text(self.language, "thinking_status", state=state))
+            elif len(parts) == 2 and parts[1].lower() in {"on", "off"}:
+                self.thinking_enabled = parts[1].lower() == "on"
+                key = "thinking_enabled" if self.thinking_enabled else "thinking_disabled_confirm"
+                self.add_line("SYS", ui_text(self.language, key))
+            else:
+                self.add_line("SYS", ui_text(self.language, "thinking_usage"))
             return
 
         if head == "/max-tokens":
@@ -1131,7 +1186,9 @@ class DS4TUI:
                 stats = TurnStats(**data["stats"])
                 self.last = stats
                 self.total.add(stats)
-                self.add_thinking(data.get("thinking", ""))
+                self.add_thinking(
+                    data.get("thinking", ""), data.get("thinking_enabled", False)
+                )
                 answer = data["answer"] or ui_text(self.language, "empty_answer")
                 self.add_line("DS4", answer)
                 self.messages = data["messages"] + [
@@ -1147,10 +1204,14 @@ class DS4TUI:
         width = max(20, width)
         for role, text in self.transcript:
             if role.startswith("THINKING:"):
-                box_language = role.partition(":")[2] or self.language
+                role_parts = role.split(":")
+                box_language = role_parts[1] if len(role_parts) > 1 else self.language
+                box_enabled = len(role_parts) < 3 or role_parts[2] == "on"
                 lines.extend(
                     ("thinking", line)
-                    for line in thinking_box_lines(str(text), box_language, width)
+                    for line in thinking_box_lines(
+                        str(text), box_language, width, box_enabled
+                    )
                 )
                 lines.append(("thinking", ""))
                 continue
@@ -1173,7 +1234,8 @@ class DS4TUI:
             lines.extend(
                 ("thinking", line)
                 for line in thinking_box_lines(
-                    self.live_content.thinking, self.language, width
+                    self.live_content.thinking, self.language, width,
+                    self.thinking_enabled,
                 )
             )
             lines.append(("thinking", ""))
@@ -1206,7 +1268,8 @@ class DS4TUI:
 
         header1 = (
             f" DS4 | DFLASH {dflash_label}/{effective} | "
-            f"LANG:{self.language.upper()} | MAX:{self.args.max_tokens} | "
+            f"LANG:{self.language.upper()} | THINK:{'ON' if self.thinking_enabled else 'OFF'} | "
+            f"MAX:{self.args.max_tokens} | "
             f"PHASE {self.phase} | TRAIN {train_status} "
         )
         safe_addstr(self.stdscr, 0, 0, header1, curses.A_REVERSE | curses.A_BOLD)
@@ -1259,8 +1322,9 @@ class DS4TUI:
             safe_addstr(self.stdscr, divider_y + 1 + index, 0, line, attr)
 
         footer = (
-            f" {self.status_message} | LANG:{self.language.upper()} | MAX:{self.args.max_tokens} | "
-            f"/language en|it | /dflash on|off|auto | "
+            f" {self.status_message} | LANG:{self.language.upper()} | "
+            f"THINK:{'ON' if self.thinking_enabled else 'OFF'} | MAX:{self.args.max_tokens} | "
+            f"/language en|it | /thinking on|off | /dflash on|off|auto | "
             f"/fallback on|off | /recover now | /help "
         )
         safe_addstr(self.stdscr, status_y, 0, footer, curses.A_REVERSE)
@@ -1375,9 +1439,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dflash", choices=("on", "off", "auto"), default="off")
     parser.add_argument("--language", choices=("en", "it"), default="en")
+    parser.add_argument(
+        "--thinking", action=argparse.BooleanOptionalAction, default=False,
+        help="enable model reasoning for initial and future turns",
+    )
     parser.add_argument("--max-tokens", type=max_tokens_argument, default=256)
     parser.add_argument("--prefill-tokens", type=int, default=2)
-    parser.add_argument("--temperature", type=float, default=0.0001)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=3600.0)

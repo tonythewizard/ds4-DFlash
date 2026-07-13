@@ -58,7 +58,10 @@ def main() -> int:
     ]
     messages = ui.build_request_messages(history, "en")
     language_count = sum(
-        message.get("content") in ui.LANGUAGE_INSTRUCTIONS.values()
+        message.get("content") in {
+            value for table in ui.THINKING_LANGUAGE_INSTRUCTIONS.values()
+            for value in table.values()
+        }
         for message in messages
     )
     payload = {
@@ -148,15 +151,15 @@ def main() -> int:
         "==========================",
         "LANG:EN (default)",
         f"OFF  {off_prefill} | proposed=0",
-        *ui.thinking_box_lines(off_content.thinking, "en", 72),
+        *ui.thinking_box_lines(off_content.thinking, "en", 72, False),
         f"DS4> {off_content.final}",
         f"ON   {on_prefill} | accepted={accepted}/{proposed}",
-        *ui.thinking_box_lines(on_content.thinking, "en", 72),
+        *ui.thinking_box_lines(on_content.thinking, "en", 72, False),
         f"DS4> {on_content.final}",
         f"OFF/ON final exact: {result['final_exact']}",
         "SYS> Language set to Italian.",
         "LANG:IT",
-        *ui.thinking_box_lines("", "it", 72),
+        *ui.thinking_box_lines("", "it", 72, False),
         f"payload system> {italian_messages[1]['content']}",
         "SYS> Conversazione azzerata",
         "SYS> Language set to English.",

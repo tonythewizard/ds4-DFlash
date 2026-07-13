@@ -45,7 +45,7 @@ def main() -> int:
     ]
     payload = {
         "model": "ds4",
-        "messages": ui.build_request_messages(history, "it"),
+        "messages": ui.build_request_messages(history, "it", False),
         "max_tokens": args.max_tokens,
         "temperature": 0.0,
         "seed": 260713,

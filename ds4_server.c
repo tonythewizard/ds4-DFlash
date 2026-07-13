@@ -12694,12 +12694,10 @@ decode_again:
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
-            temperature = DS4_DEFAULT_TEMPERATURE;
-            top_k = 0;
-            top_p = DS4_DEFAULT_TOP_P;
-            min_p = DS4_DEFAULT_MIN_P;
-        }
+        /* Thinking changes prompt/render semantics, not the caller's sampling
+         * contract. request_init() already supplies the model defaults when a
+         * client omits sampling fields; explicit deterministic parameters must
+         * remain deterministic so direct and speculative routes can agree. */
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }

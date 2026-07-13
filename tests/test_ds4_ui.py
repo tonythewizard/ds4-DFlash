@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts/ds4_ui.py"
@@ -46,6 +47,7 @@ def args(**overrides):
         sidecar_generate="http://127.0.0.1:8091/propose",
         dflash="off",
         language="en",
+        thinking=False,
         max_tokens=32,
         prefill_tokens=2,
         temperature=0.0,
@@ -257,8 +259,12 @@ class LanguageTests(unittest.TestCase):
             {"role": "system", "content": ui.LANGUAGE_INSTRUCTIONS["it"]},
         ]
         original = [dict(item) for item in history]
-        outgoing = ui.build_request_messages(history, "it")
-        language_messages = [m for m in outgoing if m["content"] in ui.LANGUAGE_INSTRUCTIONS.values()]
+        outgoing = ui.build_request_messages(history, "it", True)
+        all_instructions = {
+            value for table in ui.THINKING_LANGUAGE_INSTRUCTIONS.values()
+            for value in table.values()
+        }
+        language_messages = [m for m in outgoing if m["content"] in all_instructions]
         self.assertEqual(language_messages, [{"role": "system", "content": ui.LANGUAGE_INSTRUCTIONS["it"]}])
         self.assertIn({"role": "user", "content": "keep me"}, outgoing)
         self.assertEqual(history, original)
@@ -272,25 +278,180 @@ class LanguageTests(unittest.TestCase):
         tui.add_thinking("")
         wrapped = "\n".join(line for _, line in tui.wrapped_lines(80))
         self.assertIn("THINKING", wrapped)
-        self.assertIn("No thinking stream received", wrapped)
+        self.assertIn("Thinking disabled", wrapped)
         tui.draw()
         self.assertTrue(any("LANG:EN" in line for line in tui.stdscr.output))
+        self.assertTrue(any("THINK:OFF" in line for line in tui.stdscr.output))
         tui.handle_command("/reset")
         self.assertFalse(any(role.startswith("THINKING:") for role, _ in tui.transcript))
         self.assertIsNone(tui.live_content)
 
-    def test_payload_explicitly_disables_stochastic_thinking_and_has_one_language_instruction(self):
+    def test_payload_explicitly_disables_thinking_and_has_compact_language_instruction(self):
         tui = self.make_tui(language="it")
         payload = tui.chat_payload(tui.messages + [{"role": "user", "content": "ciao"}])
         self.assertIs(payload["thinking"], False)
         language_messages = [
             message for message in payload["messages"]
-            if message["content"] in ui.LANGUAGE_INSTRUCTIONS.values()
+            if message["content"] in {
+                value for table in ui.THINKING_LANGUAGE_INSTRUCTIONS.values()
+                for value in table.values()
+            }
         ]
         self.assertEqual(language_messages, [
-            {"role": "system", "content": ui.LANGUAGE_INSTRUCTIONS["it"]}
+            {"role": "system", "content": ui.THINKING_LANGUAGE_INSTRUCTIONS[False]["it"]}
         ])
-        self.assertIn("ragionamento visibile", language_messages[0]["content"])
+        self.assertNotIn("ragionamento visibile", language_messages[0]["content"])
+
+
+class ThinkingToggleTests(unittest.TestCase):
+    def make_tui(self, **overrides):
+        return ui.DS4TUI(FakeWindow(), args(**overrides))
+
+    def test_fresh_default_query_and_header_are_off(self):
+        tui = self.make_tui()
+        self.assertFalse(tui.thinking_enabled)
+        tui.handle_command("/thinking")
+        self.assertEqual(tui.transcript[-1][1], "Thinking is OFF. Usage: /thinking on|off")
+        tui.health = {"server": True, "sidecar": True}
+        tui._last_health_poll = float("inf")
+        tui.draw()
+        self.assertTrue(any("THINK:OFF" in line for line in tui.stdscr.output))
+
+    def test_on_off_case_insensitive_and_invalid(self):
+        tui = self.make_tui()
+        tui.handle_command("/thinking ON")
+        self.assertTrue(tui.thinking_enabled)
+        self.assertEqual(tui.transcript[-1][1], "Thinking enabled.")
+        tui.handle_command("/thinking oFf")
+        self.assertFalse(tui.thinking_enabled)
+        self.assertEqual(tui.transcript[-1][1], "Thinking disabled.")
+        tui.handle_command("/thinking perhaps")
+        self.assertFalse(tui.thinking_enabled)
+        self.assertEqual(tui.transcript[-1][1], "Usage: /thinking on|off")
+
+    def test_italian_status_confirmations_and_help(self):
+        tui = self.make_tui(language="it")
+        tui.handle_command("/thinking")
+        self.assertEqual(
+            tui.transcript[-1][1],
+            "Il ragionamento è OFF. Uso: /thinking on|off",
+        )
+        tui.handle_command("/thinking on")
+        self.assertEqual(tui.transcript[-1][1], "Ragionamento attivato.")
+        tui.handle_command("/thinking off")
+        self.assertEqual(tui.transcript[-1][1], "Ragionamento disattivato.")
+        tui.handle_command("/help")
+        self.assertIn("/thinking on", tui.transcript[-1][1])
+
+    def test_toggle_preserves_history_and_reset_preserves_mode(self):
+        tui = self.make_tui()
+        tui.messages.extend([
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "answer"},
+        ])
+        before = list(tui.messages)
+        tui.handle_command("/thinking on")
+        self.assertEqual(tui.messages, before)
+        tui.handle_command("/reset")
+        self.assertTrue(tui.thinking_enabled)
+
+    def test_control_helper_replaces_aliases_with_exactly_one_boolean(self):
+        original = {
+            "messages": [], "thinking": {"type": "enabled"},
+            "think": True, "reasoning_effort": "high",
+        }
+        for enabled in (False, True):
+            controlled = ui.apply_thinking_control(original, enabled)
+            self.assertIs(controlled["thinking"], enabled)
+            self.assertNotIn("think", controlled)
+            self.assertNotIn("reasoning_effort", controlled)
+            self.assertEqual(sum(key == "thinking" for key in controlled), 1)
+        self.assertIn("think", original)
+
+    def test_future_payloads_switch_control_and_unique_instruction(self):
+        tui = self.make_tui(language="en")
+        off = tui.chat_payload(tui.messages)
+        tui.handle_command("/thinking on")
+        on = tui.chat_payload(tui.messages)
+        self.assertIs(off["thinking"], False)
+        self.assertIs(on["thinking"], True)
+        self.assertIn(
+            ui.THINKING_LANGUAGE_INSTRUCTIONS[False]["en"],
+            [message["content"] for message in off["messages"]],
+        )
+        self.assertIn(
+            ui.THINKING_LANGUAGE_INSTRUCTIONS[True]["en"],
+            [message["content"] for message in on["messages"]],
+        )
+        self.assertEqual(len([m for m in on["messages"] if m["role"] == "system"]), 2)
+
+    def test_direct_off_on_and_dflash_builders_emit_same_setting(self):
+        tui = self.make_tui()
+        for enabled in (False, True):
+            tui.thinking_enabled = enabled
+            direct = tui.chat_payload(tui.messages)
+            continuation = tui.dflash_continuation_payload(direct, 30)
+            self.assertIs(direct["thinking"], enabled)
+            self.assertIs(continuation["thinking"], enabled)
+            self.assertIs(continuation["reasoning_active"], enabled)
+
+    def test_panel_placeholders_are_distinct_and_localized(self):
+        off_en = "\n".join(ui.thinking_box_lines("", "en", 60, False))
+        on_en = "\n".join(ui.thinking_box_lines("", "en", 60, True))
+        off_it = "\n".join(ui.thinking_box_lines("", "it", 60, False))
+        self.assertIn("Thinking disabled", off_en)
+        self.assertNotIn("No thinking stream received", off_en)
+        self.assertIn("No thinking stream received", on_en)
+        self.assertIn("Ragionamento disattivato", off_it)
+
+    def test_structured_and_tagged_reasoning_stay_separate(self):
+        structured = ui.parse_assistant_responses([{
+            "choices": [{"message": {
+                "reasoning_content": "reason", "content": "final",
+            }}]
+        }])
+        tagged = ui.parse_assistant_responses([{
+            "choices": [{"message": {"content": "<think>reason</think>final"}}]
+        }])
+        for result in (structured, tagged):
+            self.assertEqual(result, ui.AssistantContent("reason", "final"))
+            self.assertNotIn("reason", result.final)
+            self.assertNotIn("think", result.final)
+
+    def test_answer_event_uses_turn_mode_not_later_toggle(self):
+        tui = self.make_tui()
+        tui.thinking_enabled = False
+        tui.events.put(("answer", {
+            "prompt": "x", "thinking": "", "thinking_enabled": True,
+            "answer": "final", "messages": list(tui.messages),
+            "stats": ui.asdict(ui.TurnStats()),
+        }))
+        tui.process_events()
+        self.assertEqual(tui.transcript[0][0], "THINKING:en:on")
+        self.assertIn("No thinking stream received", "\n".join(
+            line for _, line in tui.wrapped_lines(80)
+        ))
+
+    def test_argparse_defaults_off_and_can_enable(self):
+        original = sys.argv
+        try:
+            sys.argv = [str(MODULE_PATH)]
+            self.assertFalse(ui.parse_args().thinking)
+            sys.argv = [str(MODULE_PATH), "--thinking"]
+            self.assertTrue(ui.parse_args().thinking)
+        finally:
+            sys.argv = original
+
+    def test_backend_error_does_not_silently_change_visible_mode(self):
+        tui = self.make_tui()
+        tui.handle_command("/thinking on")
+        payload = tui.chat_payload(tui.messages)
+        with mock.patch.object(ui, "tcp_ready", return_value=False), mock.patch.object(
+            ui, "http_json", side_effect=RuntimeError("backend rejected control")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "backend rejected control"):
+                tui.normal_chat(payload)
+        self.assertTrue(tui.thinking_enabled)
 
 
 class TokenLimitTests(unittest.TestCase):
