@@ -74,10 +74,34 @@ def main() -> int:
 
     transcript = [
         "DS4 TUI noninteractive transcript",
+        "> /language it",
+        "SYS> Lingua impostata su italiano.",
         "LANG:IT | MAX:32",
+        "> /dflash off",
+        "SYS> DFlash impostato su off; effettivo=normal",
+        f"TU> {prompt}",
+        *ui.thinking_box_lines(off_content.thinking, "it", 96),
+        f"DS4> {off_content.final}",
+        "> /reset",
+        "SYS> Conversazione azzerata",
+        "> /dflash on",
+        "SYS> DFlash impostato su on; effettivo=dflash",
+        f"TU> {prompt}",
+        *ui.thinking_box_lines(on_content.thinking, "it", 96),
+        f"DS4> {on_content.final}",
+        "> /max-tokens 8",
+        "SYS> Budget di completamento impostato a 8 token per i turni futuri.",
+        "TU> [turno bounded al limite configurato]",
+        *ui.thinking_box_lines(small["normalized"]["thinking"], "it", 96),
+        f"DS4> {small['normalized']['final']}",
+        f"NOTICE> {small['limit_notice']}",
+        "> /max-tokens 32",
+        "SYS> Budget di completamento impostato a 32 token per i turni futuri.",
+        "> /language en",
+        "SYS> Language set to English.",
+        "LANG:EN",
+        "NO RAW THINK MARKERS",
     ]
-    transcript.extend(line for _, line in tui.wrapped_lines(96))
-    transcript.extend(["LANG:EN", "NO RAW THINK MARKERS"])
     rendered = "\n".join(transcript) + "\n"
     cli.output.write_text(rendered, encoding="utf-8")
     result = {
